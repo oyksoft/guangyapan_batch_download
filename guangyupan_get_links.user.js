@@ -5,6 +5,8 @@
 // @description  获取所选文件的直链地址
 // @match        https://www.guangyapan.com/*
 // @grant        none
+// @downloadURL https://update.greasyfork.org/scripts/575452/%E5%85%89%E9%B8%AD%E4%BA%91%E7%9B%98%20-%20%E8%8E%B7%E5%8F%96%E7%9B%B4%E9%93%BE.user.js
+// @updateURL https://update.greasyfork.org/scripts/575452/%E5%85%89%E9%B8%AD%E4%BA%91%E7%9B%98%20-%20%E8%8E%B7%E5%8F%96%E7%9B%B4%E9%93%BE.meta.js
 // ==/UserScript==
 
 (function() {
@@ -330,8 +332,8 @@
         try {
             const candidates = [];
             const currentUserId = localStorage.getItem('current_user_id') ||
-                                  localStorage.getItem('userId') ||
-                                  localStorage.getItem('uid');
+                localStorage.getItem('userId') ||
+                localStorage.getItem('uid');
 
             for (let i = 0; i < localStorage.length; i++) {
                 const key = localStorage.key(i);
@@ -343,7 +345,7 @@
                         if (json.access_token) {
                             // 尝试匹配用户ID
                             const matchScore = (json.user_id === currentUserId) ? 2 :
-                                             (key.includes(currentUserId)) ? 1 : 0;
+                                (key.includes(currentUserId)) ? 1 : 0;
                             candidates.push({
                                 key,
                                 token: json.access_token,
@@ -416,28 +418,28 @@
         modal.id = 'gyp-modal-overlay';
         modal.innerHTML = '<div class="gyp-modal gyp-modal-v2">' +
             '<div class="gyp-modal-header">' +
-                '<span class="gyp-modal-title">获取直链</span>' +
-                '<button class="gyp-modal-close" id="gyp-modal-close">&times;</button>' +
+            '<span class="gyp-modal-title">获取直链</span>' +
+            '<button class="gyp-modal-close" id="gyp-modal-close">&times;</button>' +
             '</div>' +
             '<div class="gyp-modal-body">' +
-                '<div class="gyp-progress-info"><span id="gyp-progress-text">准备就绪</span></div>' +
-                '<div class="gyp-progress-bar"><div class="gyp-progress-fill" id="gyp-progress-fill"></div></div>' +
-                '<div class="gyp-result-table" id="gyp-result-table">' +
-                    '<table class="gyp-table-head"><thead><tr><th class="gyp-col-select"><input type="checkbox" id="gyp-select-all"></th><th class="gyp-col-name">文件名</th><th class="gyp-col-url">直链地址</th><th class="gyp-col-action">操作</th></tr></thead></table>' +
-                    '<div class="gyp-table-body"><table class="gyp-table-content"><tbody id="gyp-result-tbody"></tbody></table></div>' +
-                '</div>' +
-                '<div class="gyp-selected-bar" id="gyp-selected-bar" style="display:none;">' +
-                    '<span id="gyp-selected-count">已选择 0 项</span>' +
-                    '<button class="gyp-btn gyp-btn-primary" id="gyp-copy-selected">复制所选文件的URL</button>' +
-                    '<button class="gyp-btn gyp-btn-danger" id="gyp-cancel-fetch" style="display:none;">取消获取</button>' +
-                '</div>' +
-                '<div class="gyp-error-info" id="gyp-error-info"></div>' +
+            '<div class="gyp-progress-info"><span id="gyp-progress-text">准备就绪</span></div>' +
+            '<div class="gyp-progress-bar"><div class="gyp-progress-fill" id="gyp-progress-fill"></div></div>' +
+            '<div class="gyp-result-table" id="gyp-result-table">' +
+            '<table class="gyp-table-head"><thead><tr><th class="gyp-col-select"><input type="checkbox" id="gyp-select-all"></th><th class="gyp-col-name">文件名</th><th class="gyp-col-url">直链地址</th><th class="gyp-col-action">操作</th></tr></thead></table>' +
+            '<div class="gyp-table-body"><table class="gyp-table-content"><tbody id="gyp-result-tbody"></tbody></table></div>' +
+            '</div>' +
+            '<div class="gyp-selected-bar" id="gyp-selected-bar" style="display:none;">' +
+            '<span id="gyp-selected-count">已选择 0 项</span>' +
+            '<button class="gyp-btn gyp-btn-primary" id="gyp-copy-selected">复制所选文件的URL</button>' +
+            '<button class="gyp-btn gyp-btn-danger" id="gyp-cancel-fetch" style="display:none;">取消获取</button>' +
+            '</div>' +
+            '<div class="gyp-error-info" id="gyp-error-info"></div>' +
             '</div>' +
             '<div class="gyp-modal-footer">' +
-                '<button class="gyp-btn gyp-btn-primary" id="gyp-copy-all">一键复制全部链接</button>' +
-                '<button class="gyp-btn" id="gyp-modal-close-btn">关闭</button>' +
+            '<button class="gyp-btn gyp-btn-primary" id="gyp-copy-all">一键复制全部链接</button>' +
+            '<button class="gyp-btn" id="gyp-modal-close-btn">关闭</button>' +
             '</div>' +
-        '</div>';
+            '</div>';
 
         document.body.appendChild(modal);
 
