@@ -1,7 +1,8 @@
 // ==UserScript==
 // @name         光鸭云盘 - 获取直链
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @author       快乐无极
+// @version      1.3
 // @description  获取所选文件的直链地址
 // @match        https://www.guangyapan.com/*
 // @grant        none
@@ -206,7 +207,11 @@
             const fileId = row.getAttribute('data-row-key');
             if (fileId && looksLikeFileId(fileId)) {
                 marker.ids.add(fileId);
-                const nameDiv = row.querySelector('[class*="_1ioi2hrc"]');
+                // 尝试多种选择器获取文件名，稳定性优先
+                const nameDiv = row.querySelector('.ant-table-cell:nth-child(2) [title]') ||
+                    row.querySelector('.ant-table-cell:nth-child(2)') ||
+                    row.querySelector('[class*="name"]') ||
+                    row.querySelector('.ant-typography');
                 if (nameDiv) {
                     const name = nameDiv.getAttribute('title') || nameDiv.textContent;
                     if (name) marker.names.add(name.trim());
@@ -246,7 +251,8 @@
                 if (!fileId) return;
 
                 let fileName = null;
-                const nameDiv = row.querySelector('[class*="_1ioi2hrc"]');
+                const nameDiv = row.querySelector('.ant-table-cell:nth-child(2) [title]') ||
+                    row.querySelector('.ant-table-cell:nth-child(2)');
                 if (nameDiv) {
                     fileName = nameDiv.getAttribute('title') || nameDiv.textContent;
                 }
@@ -274,7 +280,8 @@
                         document.querySelectorAll('.ant-table-row-selected').forEach(row => {
                             const fileId = row.getAttribute('data-row-key');
                             if (fileId) {
-                                const nameDiv = row.querySelector('[class*="_1ioi2hrc"]');
+                                const nameDiv = row.querySelector('.ant-table-cell:nth-child(2) [title]') ||
+                                row.querySelector('.ant-table-cell:nth-child(2)');
                                 const name = nameDiv ? (nameDiv.getAttribute('title') || nameDiv.textContent) : ('文件_' + fileId);
                                 selectedFilesMap.set(fileId, { name: name.trim(), addedAt: Date.now() });
                             }
@@ -411,6 +418,17 @@
         return null;
     }
 
+    function findUploadButton() {
+        // 查找包含"上传"文字的按钮
+        const buttons = document.querySelectorAll('button');
+        for (const btn of buttons) {
+            if (btn.textContent.includes('上传')) {
+                return btn;
+            }
+        }
+        return null;
+    }
+
     function createModal() {
         if (modalCreated) return;
 
@@ -425,19 +443,22 @@
             '<div class="gyp-progress-info"><span id="gyp-progress-text">准备就绪</span></div>' +
             '<div class="gyp-progress-bar"><div class="gyp-progress-fill" id="gyp-progress-fill"></div></div>' +
             '<div class="gyp-result-table" id="gyp-result-table">' +
-            '<table class="gyp-table-head"><thead><tr><th class="gyp-col-select"><input type="checkbox" id="gyp-select-all"></th><th class="gyp-col-name">文件名</th><th class="gyp-col-url">直链地址</th><th class="gyp-col-action">操作</th></tr></thead></table>' +
+            '<table class="gyp-table-head"><thead><tr><td class="gyp-col-select"><input type="checkbox" id="gyp-select-all" class="gyp-select-all"></td><td class="gyp-col-name">文件名</td><td class="gyp-col-url">直链地址</td><td class="gyp-col-action">操作</td></tr></thead></table>' +
             '<div class="gyp-table-body"><table class="gyp-table-content"><tbody id="gyp-result-tbody"></tbody></table></div>' +
             '</div>' +
-            '<div class="gyp-selected-bar" id="gyp-selected-bar" style="display:none;">' +
+            '<div class="gyp-selected-bar" id="gyp-selected-bar">' +
+            '<div class="gyp-selected-left">' +
+            '<button class="gyp-btn gyp-btn-sm" id="gyp-deselect-selected">反选</button>' +
             '<span id="gyp-selected-count">已选择 0 项</span>' +
-            '<button class="gyp-btn gyp-btn-primary" id="gyp-copy-selected">复制所选文件的URL</button>' +
-            '<button class="gyp-btn gyp-btn-danger" id="gyp-cancel-fetch" style="display:none;">取消获取</button>' +
+            '<button class="gyp-btn gyp-btn-sm gyp-hidden" id="gyp-copy-selected-name">复制文件名</button>' +
+            '<button class="gyp-btn gyp-btn-sm gyp-hidden" id="gyp-copy-selected">复制直链</button>' +
+            '</div>' +
+            '<div class="gyp-selected-right">' +
+            '<button class="gyp-btn" id="gyp-copy-all">一键复制全部链接</button>' +
+            '<button class="gyp-btn" id="gyp-modal-close-btn">关闭</button>' +
+            '</div>' +
             '</div>' +
             '<div class="gyp-error-info" id="gyp-error-info"></div>' +
-            '</div>' +
-            '<div class="gyp-modal-footer">' +
-            '<button class="gyp-btn gyp-btn-primary" id="gyp-copy-all">一键复制全部链接</button>' +
-            '<button class="gyp-btn" id="gyp-modal-close-btn">关闭</button>' +
             '</div>' +
             '</div>';
 
@@ -455,11 +476,39 @@
             const checkboxes = tbody.querySelectorAll('.gyp-row-checkbox');
             checkboxes.forEach(function(cb) { cb.checked = checked; });
             updateSelectedBar();
+            // 全选操作后，清除 indeterminate 状态
+            this.indeterminate = false;
         };
         modal.querySelector('#gyp-copy-selected').onclick = copySelectedUrls;
-        modal.querySelector('#gyp-cancel-fetch').onclick = cancelFetch;
+        modal.querySelector('#gyp-copy-selected-name').onclick = copySelectedNames;
+        modal.querySelector('#gyp-deselect-selected').onclick = deselectAll;
 
         modalCreated = true;
+    }
+
+    function updateSelectAllState() {
+        const modal = document.getElementById('gyp-modal-overlay');
+        const tbody = modal.querySelector('#gyp-result-tbody');
+        const selectAllCheckbox = modal.querySelector('#gyp-select-all');
+        if (!tbody || !selectAllCheckbox) return;
+
+        const checkboxes = tbody.querySelectorAll('.gyp-row-checkbox');
+        const total = checkboxes.length;
+        const checked = tbody.querySelectorAll('.gyp-row-checkbox:checked').length;
+
+        if (total === 0) {
+            selectAllCheckbox.checked = false;
+            selectAllCheckbox.indeterminate = false;
+        } else if (checked === 0) {
+            selectAllCheckbox.checked = false;
+            selectAllCheckbox.indeterminate = false;
+        } else if (checked === total) {
+            selectAllCheckbox.checked = true;
+            selectAllCheckbox.indeterminate = false;
+        } else {
+            selectAllCheckbox.checked = false;
+            selectAllCheckbox.indeterminate = true;
+        }
     }
 
     function updateSelectedBar() {
@@ -467,14 +516,18 @@
         const tbody = modal.querySelector('#gyp-result-tbody');
         const checkboxes = tbody.querySelectorAll('.gyp-row-checkbox:checked');
         const count = checkboxes.length;
-        const bar = modal.querySelector('#gyp-selected-bar');
         const countSpan = modal.querySelector('#gyp-selected-count');
+        const copyNameBtn = modal.querySelector('#gyp-copy-selected-name');
+        const copyUrlBtn = modal.querySelector('#gyp-copy-selected');
+        countSpan.textContent = '已选择 ' + count + ' 项';
         if (count > 0) {
-            bar.style.display = 'flex';
-            countSpan.textContent = '已选择 ' + count + ' 项';
+            copyNameBtn.classList.remove('gyp-hidden');
+            copyUrlBtn.classList.remove('gyp-hidden');
         } else {
-            bar.style.display = 'none';
+            copyNameBtn.classList.add('gyp-hidden');
+            copyUrlBtn.classList.add('gyp-hidden');
         }
+        updateSelectAllState();
     }
 
     function copySelectedUrls() {
@@ -493,21 +546,48 @@
         }
     }
 
+    function copySelectedNames() {
+        const modal = document.getElementById('gyp-modal-overlay');
+        const tbody = modal.querySelector('#gyp-result-tbody');
+        const rows = tbody.querySelectorAll('.gyp-row-checkbox:checked');
+        const names = [];
+        rows.forEach(function(cb) {
+            const tr = cb.closest('tr');
+            if (tr) {
+                const nameCell = tr.querySelector('.gyp-col-name');
+                if (nameCell) {
+                    const name = nameCell.textContent.trim();
+                    if (name) names.push(name);
+                }
+            }
+        });
+        if (names.length > 0) {
+            copyToClipboard(names.join('\n'));
+        } else {
+            showToast('没有可复制的文件名', 2000, 'warning');
+        }
+    }
+
+    function deselectAll() {
+        const modal = document.getElementById('gyp-modal-overlay');
+        const tbody = modal.querySelector('#gyp-result-tbody');
+        const checkboxes = tbody.querySelectorAll('.gyp-row-checkbox');
+        checkboxes.forEach(function(cb) { cb.checked = !cb.checked; });
+        updateSelectedBar();
+    }
+
     function closeModal() {
+        cancelFetch();
         const modal = document.getElementById('gyp-modal-overlay');
         if (modal) {
             modal.style.display = 'none';
         }
-        cancelFetch();
     }
 
     function cancelFetch() {
         if (abortController) {
             abortController.abort();
             abortController = null;
-            showToast('已取消获取', 1500, 'warning');
-            const cancelBtn = document.getElementById('gyp-cancel-fetch');
-            if (cancelBtn) cancelBtn.style.display = 'none';
         }
     }
 
@@ -536,7 +616,6 @@
     }
 
     function resetModalState() {
-        cancelFetch();
         document.getElementById('gyp-progress-text').textContent = '准备就绪';
         document.getElementById('gyp-progress-fill').style.width = '0%';
         document.getElementById('gyp-result-tbody').innerHTML = '';
@@ -544,10 +623,10 @@
         const errorInfo = document.getElementById('gyp-error-info');
         errorInfo.innerHTML = '';
         errorInfo.style.display = 'none';
-        const selectedBar = document.getElementById('gyp-selected-bar');
-        if (selectedBar) selectedBar.style.display = 'none';
-        const cancelBtn = document.getElementById('gyp-cancel-fetch');
-        if (cancelBtn) cancelBtn.style.display = 'none';
+        // 重置复制按钮为隐藏状态
+        document.getElementById('gyp-copy-selected-name').classList.add('gyp-hidden');
+        document.getElementById('gyp-copy-selected').classList.add('gyp-hidden');
+        document.getElementById('gyp-selected-count').textContent = '已选择 0 项';
     }
 
     function updateProgress(current, total, message) {
@@ -562,7 +641,7 @@
         if (error) tr.className = 'gyp-row-error';
 
         const selectTd = document.createElement('td');
-        selectTd.className = 'gyp-cell-select';
+        selectTd.className = 'gyp-col-select';
         const checkbox = document.createElement('input');
         checkbox.type = 'checkbox';
         checkbox.className = 'gyp-row-checkbox';
@@ -571,12 +650,12 @@
         selectTd.appendChild(checkbox);
 
         const nameTd = document.createElement('td');
-        nameTd.className = 'gyp-cell-name';
+        nameTd.className = 'gyp-col-name';
         nameTd.textContent = fileName;
         nameTd.title = fileName;
 
         const urlTd = document.createElement('td');
-        urlTd.className = 'gyp-cell-url';
+        urlTd.className = 'gyp-col-url';
         if (error) {
             urlTd.textContent = '获取失败: ' + error;
             urlTd.style.color = '#dc3545';
@@ -591,7 +670,7 @@
         }
 
         const actionTd = document.createElement('td');
-        actionTd.className = 'gyp-cell-action';
+        actionTd.className = 'gyp-col-action';
         if (!error) {
             const copyNameBtn = document.createElement('button');
             copyNameBtn.className = 'gyp-btn gyp-btn-sm';
@@ -637,7 +716,7 @@
         const urls = [];
 
         for (let i = 0; i < rows.length; i++) {
-            const urlCell = rows[i].querySelector('.gyp-cell-url a');
+            const urlCell = rows[i].querySelector('.gyp-col-url a');
             if (urlCell && urlCell.textContent) {
                 urls.push(urlCell.textContent);
             }
@@ -656,7 +735,16 @@
                 reject(new Error('请求超时'));
             }, timeout);
 
-            fetch(url, { ...options, signal }).then(function(response) {
+            if (signal && signal.aborted) {
+                clearTimeout(timeoutId);
+                reject(new Error('请求已取消'));
+                return;
+            }
+
+            const controller = new AbortController();
+            const fetchSignal = signal ? signal : controller.signal;
+
+            fetch(url, { ...options, signal: fetchSignal }).then(function(response) {
                 clearTimeout(timeoutId);
                 resolve(response);
             }, function(error) {
@@ -670,16 +758,8 @@
         });
     }
 
-    async function sleep(ms, signal) {
-        return new Promise((resolve, reject) => {
-            const timeoutId = setTimeout(resolve, ms);
-            if (signal) {
-                signal.addEventListener('abort', () => {
-                    clearTimeout(timeoutId);
-                    reject(new Error('sleep aborted'));
-                });
-            }
-        });
+    async function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
     }
 
     async function getDownloadUrl(fileId, signal) {
@@ -687,6 +767,10 @@
         console.log('GYP: authHeader:', authHeader ? authHeader.substring(0, 80) + '...' : 'null');
         if (!authHeader) {
             throw new Error('未登录或Token不存在');
+        }
+
+        if (signal && signal.aborted) {
+            throw new Error('请求已取消');
         }
 
         const traceId = Math.random().toString(16).substr(2, 32);
@@ -698,7 +782,6 @@
             if (signal && signal.aborted) {
                 throw new Error('请求已取消');
             }
-
             try {
                 const response = await fetchWithTimeout(API_URL, {
                     method: 'POST',
@@ -708,7 +791,7 @@
                         'Authorization': authHeader,
                         'Content-Type': 'application/json',
                         'Origin': 'https://www.guangyapan.com',
-                        'Referer': 'https://www.guangyupan.com/',
+                        'Referer': 'https://www.guangyapan.com/',
                         'did': generateDid(),
                         'dt': '4',
                         'Sec-Ch-Ua': '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
@@ -720,8 +803,7 @@
                         'Traceparent': traceparent,
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36'
                     },
-                    body: JSON.stringify({ fileId: fileId }),
-                    signal: signal
+                    body: JSON.stringify({ fileId: fileId })
                 }, FETCH_TIMEOUT, signal);
 
                 if (!response.ok) {
@@ -736,15 +818,13 @@
                 }
             } catch (err) {
                 lastError = err;
-                if (err.message === '请求已取消') throw err;
+                if (err.message === '请求已取消') {
+                    throw err;
+                }
                 if (attempt < MAX_RETRIES - 1) {
                     const delay = RETRY_BASE_DELAY * Math.pow(2, attempt);
                     console.log(`GYP: Retry ${attempt + 1}/${MAX_RETRIES} after ${delay}ms:`, err.message);
-                    try {
-                        await sleep(delay, signal);
-                    } catch (e) {
-                        throw new Error('请求已取消');
-                    }
+                    await sleep(delay);
                 }
             }
         }
@@ -814,7 +894,8 @@
                 return;
             }
 
-            const nameDiv = row.querySelector('[class*="_1ioi2hrc"]');
+            const nameDiv = row.querySelector('.ant-table-cell:nth-child(2) [title]') ||
+                row.querySelector('.ant-table-cell:nth-child(2)');
             const name = nameDiv ? (nameDiv.getAttribute('title') || nameDiv.textContent) : ('文件_' + fileId);
             files.push({ id: fileId, name: name.trim() });
         });
@@ -827,25 +908,32 @@
         const results = [];
         let completed = 0;
         const errors = [];
+        let aborted = false;
 
         abortController = new AbortController();
         const signal = abortController.signal;
 
-        const cancelBtn = document.getElementById('gyp-cancel-fetch');
-        if (cancelBtn) cancelBtn.style.display = 'inline-block';
-
         async function processFile(file) {
+            if (signal.aborted) {
+                return { file: file, url: null, error: '已取消' };
+            }
             try {
                 const url = await getDownloadUrl(file.id, signal);
                 return { file: file, url: url, error: null };
             } catch (err) {
+                if (err.name === 'AbortError' || err.message === '请求已取消') {
+                    return { file: file, url: null, error: '已取消' };
+                }
                 return { file: file, url: null, error: err.message };
             }
         }
 
         try {
             for (let i = 0; i < files.length; i += CONCURRENCY) {
-                if (signal.aborted) break;
+                if (signal.aborted) {
+                    aborted = true;
+                    break;
+                }
 
                 const batch = files.slice(i, i + CONCURRENCY);
                 const batchPromises = batch.map(processFile);
@@ -861,18 +949,17 @@
                     }
                 }
 
-                if (i + CONCURRENCY < files.length && !signal.aborted) {
-                    await sleep(BATCH_DELAY, signal);
+                if (i + CONCURRENCY < files.length) {
+                    await sleep(BATCH_DELAY);
                 }
             }
         } catch (err) {
             console.error('GYP: Fetch error:', err);
         } finally {
             abortController = null;
-            if (cancelBtn) cancelBtn.style.display = 'none';
         }
 
-        return { errors: errors };
+        return { errors: errors, aborted: aborted };
     }
 
     async function startFetch() {
@@ -892,6 +979,14 @@
         const total = files.length;
         const successCount = total - result.errors.length;
         const failCount = result.errors.length;
+
+        // 用户取消时单独处理
+        if (result.aborted) {
+            document.getElementById('gyp-progress-text').textContent = '已取消获取';
+            document.getElementById('gyp-progress-fill').style.width = '100%';
+            showToast('用户取消获取', 3000, 'warning');
+            return;
+        }
 
         document.getElementById('gyp-progress-text').textContent = '获取完成：成功 ' + successCount + ' 个，失败 ' + failCount + ' 个';
         document.getElementById('gyp-progress-fill').style.width = '100%';
@@ -958,35 +1053,48 @@
         console.log('GYP: After scroll - checked count:', checkedAfter, '(was:', checkedBefore, ')');
     }
 
+    function removeButton() {
+        const btn = document.querySelector('.gyp-script-btn');
+        if (btn) {
+            btn.remove();
+        }
+    }
+
     function addButton() {
-        // 直接检测按钮是否已存在，不再依赖 flag
-        if (document.querySelector('.gyp-script-btn')) return;
-
-        // 在特定路由下不添加按钮
-        if (window.location.hash === '#/transfer/cloud') return;
-
-        const cloudAddBtn = findCloudAddButton();
-        if (!cloudAddBtn) {
+        // 只在 /home/ 开头的路由下添加按钮
+        if (!window.location.hash.startsWith('#/home/')) {
+            removeButton();
             return;
         }
 
-        const btnContainer = cloudAddBtn.parentNode;
+        // 如果按钮已存在，先移除再重新添加（可能需要重新定位）
+        removeButton();
+
+        const uploadBtn = findUploadButton();
+        if (!uploadBtn) {
+            return;
+        }
+
+        const btnContainer = uploadBtn.parentNode;
         if (!btnContainer) return;
 
-        // 再次检测防止竞态
-        if (document.querySelector('.gyp-script-btn')) return;
-
         const btn = document.createElement('button');
-        btn.className = cloudAddBtn.className + ' gyp-script-btn';
+        btn.className = uploadBtn.className + ' gyp-script-btn';
         btn.textContent = '获取直链';
-        btn.style.marginLeft = '8px';
-        btn.style.backgroundColor = '#ff7c24';
-        btn.style.borderColor = '#ff7c24';
+        btn.style.marginLeft = '10px';
+        btn.style.background = 'linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%)';
+        btn.style.border = 'none';
+        btn.style.borderRadius = '6px';
         btn.style.color = '#fff';
         btn.style.fontWeight = 'bold';
+        btn.style.padding = '8px 16px';
+        btn.style.boxShadow = '0 4px 15px rgba(102, 126, 234, 0.4), inset 0 1px 0 rgba(255,255,255,0.3)';
+        btn.style.textShadow = '0 1px 2px rgba(0,0,0,0.2)';
+        btn.style.transition = 'all 0.3s ease';
+        btn.style.cursor = 'pointer';
         btn.onclick = startFetch;
 
-        btnContainer.insertBefore(btn, cloudAddBtn.nextSibling);
+        btnContainer.insertBefore(btn, uploadBtn.nextSibling);
         buttonAdded = true;
         console.log('GYP: Button added successfully');
     }
@@ -1008,35 +1116,54 @@
             '.gyp-progress-bar { height: 8px; background-color: #f0f0f0; border-radius: 4px; overflow: hidden; margin-bottom: 16px; flex-shrink: 0; }',
             '.gyp-progress-fill { height: 100%; background: linear-gradient(90deg, #1890ff 0%, #40a9ff 100%); transition: width 0.3s ease; width: 0%; }',
             '.gyp-result-table { border: 1px solid #e8e8e8; border-radius: 4px; display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }',
-            '.gyp-table-head { width: 100%; border-collapse: collapse; flex-shrink: 0; }',
-            '.gyp-table-head th { background-color: #fafafa; padding: 10px 12px; text-align: left; font-weight: 500; font-size: 13px; color: #333; border-bottom: 1px solid #e8e8e8; }',
-            '.gyp-col-select { width: 40px; text-align: center; }',
-            '.gyp-col-name { width: 25%; }',
-            '.gyp-col-url { width: 40%; }',
-            '.gyp-col-action { width: 35%; }',
+            '.gyp-table-head { width: 100%; border-collapse: separate; border-spacing: 0; flex-shrink: 0; table-layout: fixed; }',
+            '.gyp-table-head td { background: linear-gradient(180deg, #e0e7ff 0%, #c7d2fe 100%); padding: 8px 12px; text-align: center; font-weight: 600; font-size: 13px; color: #4338ca; border-bottom: none; box-shadow: inset 0 2px 4px rgba(255,255,255,0.6), inset 0 -1px 2px rgba(99, 102, 241, 0.05), 0 2px 6px rgba(99, 102, 241, 0.15); text-shadow: 0 1px 2px rgba(255,255,255,0.8); letter-spacing: 1px; }',
+            '.gyp-col-select { width: 50px; text-align: center; }',
+            '.gyp-col-name { width: 35%; text-align: center; max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
+            '.gyp-col-url { width: 35%; text-align: center; max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
+            '.gyp-col-action { width: 30%; text-align: center; }',
             '.gyp-table-body { overflow-y: auto; flex: 1; min-height: 0; }',
-            '.gyp-table-content { width: 100%; border-collapse: collapse; }',
-            '.gyp-table-content td { padding: 10px 12px; font-size: 13px; color: #666; border-bottom: 1px solid #e8e8e8; }',
+            '.gyp-table-content { width: 100%; border-collapse: collapse; table-layout: fixed; }',
+            '.gyp-table-content td { padding: 12px 12px; font-size: 13px; color: #666; border-bottom: 1px solid #e8e8e8; text-align: center; background-color: #fff; }',
             '.gyp-table-content tr:last-child td { border-bottom: none; }',
             '.gyp-table-content tr.gyp-row-error { background-color: #fff2f0; }',
             '.gyp-table-content tr:hover { background-color: #f5f5f5; }',
             '.gyp-cell-name { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
             '.gyp-cell-select { text-align: center; }',
             '.gyp-cell-url { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
-            '.gyp-cell-url a { color: #1890ff; text-decoration: none; }',
-            '.gyp-cell-url a:hover { text-decoration: underline; }',
+            '.gyp-col-url a { color: #1890ff; text-decoration: none; }',
+            '.gyp-col-url a:hover { text-decoration: underline; }',
             '.gyp-cell-action { white-space: nowrap; }',
+            '.gyp-row-checkbox { width: 18px; height: 18px; cursor: pointer; accent-color: #1890ff; }',
+            '.gyp-select-all { width: 18px; height: 18px; cursor: pointer; accent-color: #1890ff; }',
             '.gyp-error-info { margin-top: 12px; padding: 12px; background-color: #fff2f0; border: 1px solid #ffccc7; border-radius: 4px; font-size: 13px; color: #dc3545; display: none; flex-shrink: 0; max-height: 100px; overflow-y: auto; }',
-            '.gyp-selected-bar { display: none; align-items: center; gap: 16px; padding: 12px 16px; background: #f0f0f0; border-top: 1px solid #e8e8e8; flex-shrink: 0; }',
-            '.gyp-modal-footer { display: flex; justify-content: center; gap: 12px; padding: 16px 20px; border-top: 1px solid #e8e8e8; flex-shrink: 0; }',
+            '.gyp-selected-bar { display: flex; justify-content: space-between; align-items: center; padding: 16px 16px 20px 16px; background: linear-gradient(180deg, #f8f9ff 0%, #eef1fa 100%); border-top: 1px solid #d4d8f0; flex-shrink: 0; margin-top: 8px; }',
+            '.gyp-selected-left { display: flex; align-items: center; gap: 12px; }',
+            '.gyp-selected-right { display: flex; align-items: center; gap: 12px; }',
+            // 反选按钮 - 极光绿渐变
+            '.gyp-selected-bar #gyp-deselect-selected { background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); border: none; color: #fff; box-shadow: 0 2px 8px rgba(56, 239, 125, 0.3); transition: all 0.3s ease; }',
+            '.gyp-selected-bar #gyp-deselect-selected:hover { background: linear-gradient(135deg, #15b3a6 0%, #4ff88f 100%); box-shadow: 0 4px 12px rgba(56, 239, 125, 0.4); transform: translateY(-1px); }',
+            // 复制文件名按钮 - 科技蓝渐变风格
+            '.gyp-selected-bar #gyp-copy-selected-name { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border: none; color: #fff; box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3); transition: all 0.3s ease; }',
+            '.gyp-selected-bar #gyp-copy-selected-name:hover { background: linear-gradient(135deg, #7b8ff0 0%, #8a5cb8 100%); box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4); transform: translateY(-1px); }',
+            // 复制直链按钮 - 活力橙渐变风格
+            '.gyp-selected-bar #gyp-copy-selected { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); border: none; color: #fff; box-shadow: 0 2px 8px rgba(245, 87, 108, 0.3); transition: all 0.3s ease; }',
+            '.gyp-selected-bar #gyp-copy-selected:hover { background: linear-gradient(135deg, #f2a3fc 0%, #f76d84 100%); box-shadow: 0 4px 12px rgba(245, 87, 108, 0.4); transform: translateY(-1px); }',
+            // 一键复制全部链接 - 阳光黄渐变，更大更突出
+            '.gyp-selected-bar #gyp-copy-all { background: linear-gradient(135deg, #f5af19 0%, #f12711 100%); border: none; color: #fff; font-size: 15px; font-weight: bold; padding: 10px 24px; box-shadow: 0 4px 12px rgba(245, 39, 17, 0.4); transition: all 0.3s ease; }',
+            '.gyp-selected-bar #gyp-copy-all:hover { background: linear-gradient(135deg, #f7c41f 0%, #f23921 100%); box-shadow: 0 6px 16px rgba(245, 39, 17, 0.5); transform: translateY(-2px); }',
+            // 关闭按钮 - 沉稳灰蓝渐变，更大更突出
+            '.gyp-selected-bar #gyp-modal-close-btn { background: linear-gradient(135deg, #4b6cb7 0%, #182848 100%); border: none; color: #fff; font-size: 15px; font-weight: bold; padding: 10px 24px; box-shadow: 0 4px 12px rgba(24, 40, 72, 0.4); transition: all 0.3s ease; }',
+            '.gyp-selected-bar #gyp-modal-close-btn:hover { background: linear-gradient(135deg, #5b7cc7 0%, #283858 100%); box-shadow: 0 6px 16px rgba(24, 40, 72, 0.5); transform: translateY(-2px); }',
             '.gyp-btn { padding: 8px 20px; font-size: 14px; border-radius: 4px; cursor: pointer; border: 1px solid #d9d9d9; background: #fff; color: #333; transition: all 0.2s ease; }',
+            '.gyp-hidden { display: none !important; }',
             '.gyp-btn:hover { color: #1890ff; border-color: #1890ff; }',
             '.gyp-btn-primary { background: #1890ff; border-color: #1890ff; color: #fff; }',
             '.gyp-btn-primary:hover { background: #40a9ff; border-color: #40a9ff; color: #fff; }',
             '.gyp-btn-danger { background: #ff4d4f; border-color: #ff4d4f; color: #fff; }',
             '.gyp-btn-danger:hover { background: #ff7875; border-color: #ff7875; color: #fff; }',
             '.gyp-btn-sm { padding: 4px 10px; font-size: 12px; cursor: pointer; }',
-            '.gyp-script-btn:hover { background-color: #ff8533 !important; border-color: #ff8533 !important; color: #fff !important; }',
+            '.gyp-script-btn:hover { background: linear-gradient(135deg, #5a67d8 0%, #6b46c1 50%, #e879f9 100%) !important; box-shadow: 0 6px 20px rgba(102, 126, 234, 0.5), inset 0 1px 0 rgba(255,255,255,0.3) !important; transform: translateY(-1px); }',
             '.gyp-toast { position: fixed; top: 80px; left: 50%; transform: translateX(-50%); z-index: 1000000; background: rgba(0, 0, 0, 0.75); color: #fff; padding: 12px 24px; border-radius: 6px; font-size: 14px; opacity: 0; transition: opacity 0.3s ease; pointer-events: none; }',
             '.gyp-toast.gyp-toast-show { opacity: 1; }',
             '.gyp-toast.gyp-toast-warning { background: rgba(250, 173, 20, 0.95); }',
@@ -1047,7 +1174,6 @@
     }
 
     function tryInit() {
-        if (document.querySelector('.gyp-script-btn')) return;
         addStyles();
         addButton();
     }
@@ -1071,11 +1197,13 @@
             scheduleInit();
         }
 
-        // 使用 MutationObserver 监听页面变化，检测云添加按钮
+        // 使用 MutationObserver 监听页面变化，检测上传按钮
         const observer = new MutationObserver(() => {
-            const cloudBtn = findCloudAddButton();
-            if (cloudBtn && !document.querySelector('.gyp-script-btn')) {
-                tryInit();
+            if (window.location.hash.startsWith('#/home/')) {
+                const uploadBtn = findUploadButton();
+                if (uploadBtn && !document.querySelector('.gyp-script-btn')) {
+                    tryInit();
+                }
             }
             // 定期清理过期的选中记录
             cleanExpiredSelections();
@@ -1083,20 +1211,15 @@
 
         observer.observe(document.body || document.documentElement, {
             childList: true,
-            subtree: true,
-            characterData: true
+            subtree: true
         });
 
         // 监听 URL 变化（SPA 页面切换）
-        let lastUrl = location.href;
-        setInterval(() => {
-            if (location.href !== lastUrl) {
-                lastUrl = location.href;
-                // 页面切换后直接尝试添加，不重置 flag
-                setTimeout(tryInit, 500);
-                setTimeout(tryInit, 1500);
-            }
-        }, 1000);
+        window.addEventListener('hashchange', () => {
+            // 页面切换后直接尝试添加，不重置 flag
+            setTimeout(tryInit, 500);
+            setTimeout(tryInit, 1500);
+        });
     }
 
     init();
