@@ -2,7 +2,7 @@
 // @name         光鸭云盘 - 获取直链
 // @namespace    http://tampermonkey.net/
 // @author       快乐无极
-// @version      1.3
+// @version      1.4
 // @description  获取所选文件的直链地址
 // @match        https://www.guangyapan.com/*
 // @grant        none
@@ -15,13 +15,12 @@
 
     const API_URL = 'https://api.guangyapan.com/nd.bizuserres.s/v1/get_res_download_url';
     const CONCURRENCY = 3;
-    const BATCH_DELAY = 500;
+    const BATCH_DELAY = 200;
     const FETCH_TIMEOUT = 10000;
     const MAX_RETRIES = 3;
     const RETRY_BASE_DELAY = 500;
 
     let modalCreated = false;
-    let buttonAdded = false;
     let abortController = null;
 
     // 记录选中的文件
@@ -394,30 +393,6 @@
         return 'Bearer ' + token;
     }
 
-    function findCloudAddButton() {
-        // 尝试多种选择器提高稳定性
-        const selectors = [
-            'button[class*="addcloud"]',
-            'button:has(.swangpan-icon-addcloud)',
-            'button'
-        ];
-
-        for (const selector of selectors) {
-            if (selector === 'button') {
-                const buttons = document.querySelectorAll('button');
-                for (const btn of buttons) {
-                    if (btn.textContent.includes('云添加') && btn.querySelector('.swangpan-icon-addcloud')) {
-                        return btn;
-                    }
-                }
-            } else {
-                const btn = document.querySelector(selector);
-                if (btn) return btn;
-            }
-        }
-        return null;
-    }
-
     function findUploadButton() {
         // 查找包含"上传"文字的按钮
         const buttons = document.querySelectorAll('button');
@@ -440,8 +415,16 @@
             '<button class="gyp-modal-close" id="gyp-modal-close">&times;</button>' +
             '</div>' +
             '<div class="gyp-modal-body">' +
-            '<div class="gyp-progress-info"><span id="gyp-progress-text">准备就绪</span></div>' +
-            '<div class="gyp-progress-bar"><div class="gyp-progress-fill" id="gyp-progress-fill"></div></div>' +
+            '<div class="gyp-progress-wrapper">' +
+            '<div class="gyp-progress-info">' +
+            '<span id="gyp-progress-text">准备就绪</span>' +
+            '<span id="gyp-progress-percent">0%</span>' +
+            '</div>' +
+            '<div class="gyp-progress-bar">' +
+            '<div class="gyp-progress-fill" id="gyp-progress-fill"></div>' +
+            '<div class="gyp-progress-glow"></div>' +
+            '</div>' +
+            '</div>' +
             '<div class="gyp-result-table" id="gyp-result-table">' +
             '<table class="gyp-table-head"><thead><tr><td class="gyp-col-select"><input type="checkbox" id="gyp-select-all" class="gyp-select-all"></td><td class="gyp-col-name">文件名</td><td class="gyp-col-url">直链地址</td><td class="gyp-col-action">操作</td></tr></thead></table>' +
             '<div class="gyp-table-body"><table class="gyp-table-content"><tbody id="gyp-result-tbody"></tbody></table></div>' +
@@ -617,6 +600,7 @@
 
     function resetModalState() {
         document.getElementById('gyp-progress-text').textContent = '准备就绪';
+        document.getElementById('gyp-progress-percent').textContent = '0%';
         document.getElementById('gyp-progress-fill').style.width = '0%';
         document.getElementById('gyp-result-tbody').innerHTML = '';
         document.getElementById('gyp-select-all').checked = false;
@@ -632,6 +616,7 @@
     function updateProgress(current, total, message) {
         const percent = Math.round((current / total) * 100);
         document.getElementById('gyp-progress-text').textContent = message || '正在获取: ' + current + '/' + total;
+        document.getElementById('gyp-progress-percent').textContent = percent + '%';
         document.getElementById('gyp-progress-fill').style.width = percent + '%';
     }
 
@@ -905,7 +890,6 @@
     }
 
     async function fetchWithConcurrency(files) {
-        const results = [];
         let completed = 0;
         const errors = [];
         let aborted = false;
@@ -1005,54 +989,6 @@
         }
     }
 
-    async function scrollToRenderAllSelected() {
-        // 虚拟滚动情况下，需要滚动让所有选中的文件都渲染出来
-        const checkedBefore = document.querySelectorAll('.ant-checkbox-checked').length;
-        if (checkedBefore === 0) return;
-
-        console.log('GYP: Starting scroll to render all selected files, initial count:', checkedBefore);
-
-        // 优先尝试 ant-table-tbody（用户反馈这是滚动容器）
-        let scrollContainer = document.querySelector('.ant-table-tbody');
-        if (!scrollContainer) {
-            scrollContainer = document.querySelector('.ant-table-body');
-        }
-        if (!scrollContainer) {
-            scrollContainer = document.querySelector('[class*="virtual-list"], [class*="scroll-content"]');
-        }
-
-        if (!scrollContainer) {
-            console.log('GYP: No scroll container found, using window');
-            let lastCount = 0;
-            for (let i = 0; i < 20; i++) {
-                window.scrollBy(0, 500);
-                await sleep(200);
-                const currentCount = document.querySelectorAll('.ant-checkbox-checked').length;
-                if (currentCount === lastCount) break;
-                lastCount = currentCount;
-            }
-            window.scrollTo(0, 0);
-        } else {
-            console.log('GYP: Found scroll container:', scrollContainer.className || scrollContainer.tagName);
-            const scrollHeight = scrollContainer.scrollHeight || scrollContainer.scrollHeight;
-            let lastCount = 0;
-            for (let i = 0; i < 20; i++) {
-                // 逐步滚动，每次增加一定距离
-                const step = Math.max(100, scrollHeight / 10);
-                scrollContainer.scrollTop = scrollContainer.scrollTop + step;
-                await sleep(300);
-                const currentCount = document.querySelectorAll('.ant-checkbox-checked').length;
-                console.log('GYP: Scroll', i, 'scrollTop:', scrollContainer.scrollTop, 'checked:', currentCount);
-                if (currentCount === lastCount && i > 2) break;
-                lastCount = currentCount;
-            }
-            scrollContainer.scrollTop = 0;
-        }
-
-        const checkedAfter = document.querySelectorAll('.ant-checkbox-checked').length;
-        console.log('GYP: After scroll - checked count:', checkedAfter, '(was:', checkedBefore, ')');
-    }
-
     function removeButton() {
         const btn = document.querySelector('.gyp-script-btn');
         if (btn) {
@@ -1095,7 +1031,6 @@
         btn.onclick = startFetch;
 
         btnContainer.insertBefore(btn, uploadBtn.nextSibling);
-        buttonAdded = true;
         console.log('GYP: Button added successfully');
     }
 
@@ -1112,12 +1047,18 @@
             '.gyp-modal-close { background: none; border: none; font-size: 24px; cursor: pointer; color: #999; padding: 0; line-height: 1; }',
             '.gyp-modal-close:hover { color: #666; }',
             '.gyp-modal-body { padding: 20px; flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }',
-            '.gyp-progress-info { margin-bottom: 8px; font-size: 14px; color: #666; flex-shrink: 0; }',
-            '.gyp-progress-bar { height: 8px; background-color: #f0f0f0; border-radius: 4px; overflow: hidden; margin-bottom: 16px; flex-shrink: 0; }',
-            '.gyp-progress-fill { height: 100%; background: linear-gradient(90deg, #1890ff 0%, #40a9ff 100%); transition: width 0.3s ease; width: 0%; }',
+            '.gyp-progress-wrapper { margin-bottom: 16px; flex-shrink: 0; }',
+            '.gyp-progress-info { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 14px; font-weight: 500; }',
+            '.gyp-progress-text { color: #333; }',
+            '.gyp-progress-percent { color: #667eea; font-weight: 600; font-size: 14px; text-shadow: 0 1px 2px rgba(102, 126, 234, 0.3); }',
+            '.gyp-progress-bar { height: 10px; background: linear-gradient(180deg, #e8eaf6 0%, #f5f5f5 100%); border-radius: 10px; overflow: hidden; position: relative; box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.1), 0 1px 0 rgba(255, 255, 255, 0.8); }',
+            '.gyp-progress-fill { height: 100%; background: linear-gradient(90deg, #667eea 0%, #764ba2 50%, #f093fb 100%); border-radius: 10px; transition: width 0.4s ease; position: relative; box-shadow: 0 0 10px rgba(102, 126, 234, 0.5), 0 2px 4px rgba(0, 0, 0, 0.1); }',
+            '.gyp-progress-fill::after { content: ""; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.3) 50%, transparent 100%); animation: gyp-shine 2s infinite; }',
+            '.gyp-progress-glow { position: absolute; top: 50%; left: 0; transform: translateY(-50%); height: 20px; width: 60px; background: radial-gradient(ellipse at center, rgba(240, 147, 251, 0.4) 0%, transparent 70%); pointer-events: none; }',
+            '@keyframes gyp-shine { 0% { transform: translateX(-100%); } 100% { transform: translateX(200%); } }',
             '.gyp-result-table { border: 1px solid #e8e8e8; border-radius: 4px; display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }',
             '.gyp-table-head { width: 100%; border-collapse: separate; border-spacing: 0; flex-shrink: 0; table-layout: fixed; }',
-            '.gyp-table-head td { background: linear-gradient(180deg, #e0e7ff 0%, #c7d2fe 100%); padding: 8px 12px; text-align: center; font-weight: 600; font-size: 13px; color: #4338ca; border-bottom: none; box-shadow: inset 0 2px 4px rgba(255,255,255,0.6), inset 0 -1px 2px rgba(99, 102, 241, 0.05), 0 2px 6px rgba(99, 102, 241, 0.15); text-shadow: 0 1px 2px rgba(255,255,255,0.8); letter-spacing: 1px; }',
+            '.gyp-table-head td { background: linear-gradient(180deg, #f0f4ff 0%, #e8edff 100%); padding: 8px 12px; text-align: center; font-weight: 600; font-size: 13px; color: #5a67d8; border-bottom: none; box-shadow: inset 0 2px 4px rgba(255,255,255,0.8), inset 0 -1px 2px rgba(99, 102, 241, 0.03), 0 2px 4px rgba(99, 102, 241, 0.08); text-shadow: 0 1px 2px rgba(255,255,255,0.8); letter-spacing: 1px; }',
             '.gyp-col-select { width: 50px; text-align: center; }',
             '.gyp-col-name { width: 35%; text-align: center; max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
             '.gyp-col-url { width: 35%; text-align: center; max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
