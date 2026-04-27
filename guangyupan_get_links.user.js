@@ -1507,8 +1507,8 @@
         const style = document.createElement('style');
         style.id = 'gyp-styles';
         style.textContent = [
-            '#gyp-modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.5); z-index: 999999; justify-content: center; align-items: center; }',
-            '.gyp-modal-v2 { background: #fff; border-radius: 8px; width: 900px; max-width: 95%; max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 4px 24px rgba(0, 0, 0, 0.2); overflow: hidden; user-select: text; -webkit-user-select: text; }',
+            '#gyp-modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.5); z-index: 999999; justify-content: center; align-items: flex-start; padding: 50px 0; overflow: auto; }',
+            '.gyp-modal-v2 { background: #fff; border-radius: 8px; width: 900px !important; min-width: 900px !important; max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 4px 24px rgba(0, 0, 0, 0.2); overflow: hidden; user-select: text; -webkit-user-select: text; flex-shrink: 0; }',
             '.gyp-modal-header { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid #e8e8e8; flex-shrink: 0; }',
             '.gyp-modal-title { font-size: 16px; font-weight: 500; color: #333; }',
             '.gyp-modal-header-actions { display: flex; align-items: center; gap: 8px; }',
