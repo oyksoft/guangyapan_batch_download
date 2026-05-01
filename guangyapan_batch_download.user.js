@@ -2,10 +2,12 @@
 // @name         光鸭云盘 - 获取直链
 // @namespace    http://tampermonkey.net/
 // @author       快乐无极
-// @version      1.5
+// @version      1.6
 // @description  获取所选文件的直链地址
 // @match        https://www.guangyapan.com/*
 // @grant        GM.xmlHttpRequest
+// @connect      localhost
+// @connect      127.0.0.1
 // @connect      *
 // @downloadURL https://update.greasyfork.org/scripts/575452/%E5%85%89%E9%B8%AD%E4%BA%91%E7%9B%98%20-%20%E8%8E%B7%E5%8F%96%E7%9B%B4%E9%93%BE.user.js
 // @updateURL https://update.greasyfork.org/scripts/575452/%E5%85%89%E9%B8%AD%E4%BA%91%E7%9B%98%20-%20%E8%8E%B7%E5%8F%96%E7%9B%B4%E9%93%BE.meta.js
@@ -338,18 +340,6 @@
     }
 
     // 动态生成设备ID
-    function generateDid() {
-        const stored = localStorage.getItem('gyp_generated_did');
-        if (stored) return stored;
-        const chars = '0123456789abcdef';
-        let did = '';
-        for (let i = 0; i < 32; i++) {
-            did += chars[Math.floor(Math.random() * chars.length)];
-        }
-        localStorage.setItem('gyp_generated_did', did);
-        return did;
-    }
-
     function getAuthToken() {
         try {
             const candidates = [];
@@ -434,18 +424,6 @@
             }
         }
         return { rpc: '', secret: '' };
-    }
-
-    function saveAria2Config() {
-        const rpc = document.querySelector('#gyp-aria2-config-rpc')?.value?.trim();
-        const secret = document.querySelector('#gyp-aria2-config-secret')?.value || '';
-        if (!rpc) {
-            showToast('请输入 RPC 地址', 2000, 'warning');
-            return;
-        }
-        localStorage.setItem(ARIA2_STORAGE_KEY, JSON.stringify({ rpc, secret }));
-        showToast('配置已保存');
-        updateAria2ButtonState();
     }
 
     function getAria2Config() {
@@ -533,6 +511,10 @@
                         </label>
                         <input type="text" class="form-input" id="gyp-shadow-rpc" placeholder="http://localhost:6800/jsonrpc" value="${config.rpc || 'http://localhost:6800/jsonrpc'}">
                         <div class="form-hint">Aria2 RPC 服务地址，通常为本地地址</div>
+                        <div class="form-hint" style="color: #b45309; display: flex; align-items: flex-start; gap: 8px; line-height: 1.6;">
+                            <span style="font-size: 28px; line-height: 1; flex-shrink: 0;">💡</span>
+                            <span>非 localhost/127.0.0.1 域名发送时会弹窗请求授权，建议选择"总是允许"，之后发送将直接通过，无需重复授权。</span>
+                        </div>
                     </div>
                     <div class="form-group">
                         <label class="form-label">
@@ -680,7 +662,7 @@
         const config = getAria2Config();
         if (!config.rpc) {
             showToast('请先配置 RPC 地址', 2000, 'warning');
-            return { success: 0, failed: 0 };
+            return { success: 0, failed: 0, errors: [] };
         }
 
         const secret = config.secret ? 'token:' + config.secret : '';
@@ -688,6 +670,7 @@
 
         let success = 0;
         let failed = 0;
+        const errors = [];
 
         for (const link of links) {
             try {
@@ -704,31 +687,150 @@
                         }),
                         onload: function(response) {
                             try {
-                                const data = JSON.parse(response.responseText);
-                                resolve(data);
+                                resolve(JSON.parse(response.responseText));
                             } catch (e) {
                                 reject(e);
                             }
                         },
-                        onerror: function(err) {
-                            reject(err);
-                        }
+                        onerror: reject
                     });
                 });
 
                 if (result.error) {
                     console.error('Aria2 error:', result.error);
+                    let errMsg = result.error.message || '';
+                    if (errMsg === 'Unauthorized' || errMsg === 'Forbidden' || result.error.code === -32600) {
+                        errMsg = '密钥错误，请检查 RPC 密钥配置是否正确';
+                    } else if (errMsg === 'Not Found' || result.error.code === -32600) {
+                        errMsg = 'Aria2 方法不存在，可能是版本不兼容';
+                    } else if (!errMsg) {
+                        errMsg = 'Aria2 返回错误: ' + JSON.stringify(result.error);
+                    }
+                    errors.push({ name: link.name, error: errMsg });
                     failed++;
+                    break;
                 } else {
                     success++;
                 }
             } catch (err) {
                 console.error('Aria2 request failed:', err);
+                let errMsg;
+                const errStr = (err.error || err.statusText || '').toLowerCase();
+                if (errStr.includes('blocked by the user') || errStr.includes('denied') || errStr.includes('refused')) {
+                    errMsg = '请求被拒绝，请在弹窗中选择"允许"以继续请求';
+                } else if (err.status === 0 || err.status === undefined) {
+                    errMsg = '无法连接到 Aria2 服务，请确认服务已启动且 RPC 地址正确';
+                } else if (err.status >= 400 && err.status < 500) {
+                    errMsg = '请求错误 (HTTP ' + err.status + ')';
+                } else if (err.status >= 500) {
+                    errMsg = 'Aria2 服务器错误 (HTTP ' + err.status + ')';
+                } else {
+                    errMsg = err.statusText || ('HTTP ' + err.status);
+                }
+                errors.push({ name: link.name, error: errMsg });
                 failed++;
+                break;
             }
         }
 
-        return { success, failed };
+        return { success, failed, errors };
+    }
+
+    function showAria2ErrorAlert(errors) {
+        const errorList = errors.map(e => '<div style="margin-bottom: 8px; border-bottom: 1px solid #fecaca; padding-bottom: 8px;"><div style="font-weight: 600; color: #dc2626; word-break: break-all;">' + e.name + '</div><div style="color: #991b1b; font-size: 13px;">' + e.error + '</div></div>').join('');
+        const overlay = document.createElement('div');
+        overlay.id = 'gyp-aria2-error-overlay';
+        overlay.style.cssText = 'position: fixed; inset: 0; z-index: 10000000; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0.5);';
+        overlay.innerHTML =
+            '<div style="width: 500px; max-width: 90%; max-height: 80vh; background: #fef2f2; border: 2px solid #ef4444; border-radius: 12px; overflow: hidden; flex-shrink: 0;">' +
+            '<div style="padding: 16px 20px; background: #dc2626; color: #fff; display: flex; justify-content: space-between; align-items: center;">' +
+            '<div style="font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 8px;">' +
+            '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>' +
+            'Aria2 发送失败' +
+            '</div>' +
+            '<button id="gyp-error-close-btn" style="background: none; border: none; color: #fff; font-size: 24px; cursor: pointer; padding: 0; line-height: 1;">×</button>' +
+            '</div>' +
+            '<div style="padding: 16px; overflow-y: auto; max-height: calc(80vh - 120px);">' +
+            '<div style="margin-bottom: 12px; color: #991b1b; font-weight: 600;">遇到错误，发送已中断，以下文件未能发送：</div>' +
+            errorList +
+            '</div>' +
+            '<div style="padding: 12px 16px; border-top: 1px solid #fecaca; display: flex; justify-content: center;">' +
+            '<button id="gyp-error-close-btn-bottom" style="padding: 8px 24px; background: #dc2626; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500;">我知道了</button>' +
+            '</div>' +
+            '</div>';
+        document.body.appendChild(overlay);
+        document.getElementById('gyp-error-close-btn').addEventListener('click', function() {
+            overlay.remove();
+        });
+        document.getElementById('gyp-error-close-btn-bottom').addEventListener('click', function() {
+            overlay.remove();
+        });
+        overlay.addEventListener('click', function(e) {
+            if (e.target === overlay) {
+                overlay.remove();
+            }
+        });
+    }
+
+    function showAria2SuccessAlert(count) {
+        const overlay = document.createElement('div');
+        overlay.id = 'gyp-aria2-success-overlay';
+        overlay.style.cssText = 'position: fixed; inset: 0; z-index: 10000000; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0.5);';
+        overlay.innerHTML =
+            '<div style="width: 340px; max-width: 90%; background: #fff; border: 2px solid #22c55e; border-radius: 12px; overflow: hidden; flex-shrink: 0;">' +
+            '<div style="padding: 24px; display: flex; align-items: center; gap: 16px;">' +
+            '<svg class="gyp-success-checkmark" width="60" height="60" viewBox="0 0 60 60" style="flex-shrink: 0;">' +
+            '<circle cx="30" cy="30" r="26" fill="none" stroke="#22c55e" stroke-width="3"/>' +
+            '<path class="gyp-check-path" d="M18 30 L26 38 L42 22" fill="none" stroke="#22c55e" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>' +
+            '</svg>' +
+            '<div style="flex: 1;">' +
+            '<div style="font-size: 18px; font-weight: 600; color: #15803d;">发送成功</div>' +
+            '<div style="font-size: 15px; font-weight: 600; color: #166534; margin-top: 4px;">' + count + ' 个任务已发送到 Aria2</div>' +
+            '<div style="font-size: 13px; color: #166534; margin-top: 2px;"><span id="gyp-success-seconds">3</span> 秒后自动关闭</div>' +
+            '</div>' +
+            '</div>' +
+            '<div style="padding: 12px 16px; border-top: 1px solid #bbf7d0; display: flex; justify-content: center;">' +
+            '<button id="gyp-success-close-btn" style="padding: 6px 20px; background: #22c55e; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500;">我知道了</button>' +
+            '</div>' +
+            '</div>';
+        document.body.appendChild(overlay);
+
+        // 动画样式
+        const style = document.createElement('style');
+        style.textContent =
+            '@keyframes gyp-check-draw { 0% { stroke-dashoffset: 50; } 100% { stroke-dashoffset: 0; } }' +
+            '@keyframes gyp-circle-draw { 0% { stroke-dashoffset: 170; } 100% { stroke-dashoffset: 0; } }';
+        document.head.appendChild(style);
+
+        const checkPath = overlay.querySelector('.gyp-check-path');
+        checkPath.style.strokeDasharray = '50';
+        checkPath.style.strokeDashoffset = '50';
+        checkPath.style.animation = 'gyp-check-draw 0.4s ease-out 0.3s forwards';
+
+        const circle = overlay.querySelector('circle');
+        circle.style.strokeDasharray = '170';
+        circle.style.strokeDashoffset = '170';
+        circle.style.animation = 'gyp-circle-draw 0.5s ease-out forwards';
+
+        const closeAlert = function() {
+            overlay.remove();
+            style.remove();
+        };
+        document.getElementById('gyp-success-close-btn').addEventListener('click', closeAlert);
+
+        // 3秒后自动关闭
+        let remaining = 3;
+        const secondsSpan = document.getElementById('gyp-success-seconds');
+        const updateCountdown = function() {
+            remaining--;
+            if (remaining > 0 && secondsSpan) {
+                secondsSpan.textContent = remaining;
+                setTimeout(updateCountdown, 1000);
+            } else {
+                closeAlert();
+            }
+        };
+        setTimeout(updateCountdown, 1000);
     }
 
     function formatSize(bytes) {
@@ -802,10 +904,14 @@
         showConfirmModal('确认下载', '即将下载选中的文件到 Aria2', links.length, totalSize, async () => {
             showToast('正在发送到 Aria2...', 3000);
             const result = await aria2SendLinks(links);
+            hideToast();
             if (result.failed === 0) {
-                showToast('成功发送 ' + result.success + ' 个任务到 Aria2');
+                showAria2SuccessAlert(result.success);
             } else {
                 showToast('发送完成：成功 ' + result.success + ' 个，失败 ' + result.failed + ' 个', 3000, 'warning');
+                if (result.errors.length > 0) {
+                    showAria2ErrorAlert(result.errors);
+                }
             }
         });
     }
@@ -825,28 +931,16 @@
         showConfirmModal('确认下载全部', '即将下载全部文件到 Aria2', links.length, totalSize, async () => {
             showToast('正在发送到 Aria2...', 3000);
             const result = await aria2SendLinks(links);
+            hideToast();
             if (result.failed === 0) {
-                showToast('成功发送 ' + result.success + ' 个任务到 Aria2');
+                showAria2SuccessAlert(result.success);
             } else {
                 showToast('发送完成：成功 ' + result.success + ' 个，失败 ' + result.failed + ' 个', 3000, 'warning');
+                if (result.errors.length > 0) {
+                    showAria2ErrorAlert(result.errors);
+                }
             }
         });
-    }
-
-    function updateAria2Buttons() {
-        const modal = document.getElementById('gyp-modal-overlay');
-        if (!modal) return;
-        const sendSelectedBtn = modal.querySelector('#gyp-aria2-send-selected');
-        const sendAllBtn = modal.querySelector('#gyp-aria2-send-all');
-        const config = getAria2Config();
-
-        if (config.rpc) {
-            sendSelectedBtn.disabled = false;
-            sendAllBtn.disabled = false;
-        } else {
-            sendSelectedBtn.disabled = true;
-            sendAllBtn.disabled = true;
-        }
     }
 
     function createModal() {
@@ -899,9 +993,6 @@
 
         modal.querySelector('#gyp-modal-close').onclick = closeModal;
         modal.querySelector('#gyp-modal-close-btn').onclick = closeModal;
-        modal.onclick = function(e) {
-            if (e.target === modal) closeModal();
-        };
         modal.querySelector('#gyp-copy-all').onclick = copyAllUrls;
         modal.querySelector('#gyp-select-all').onclick = function() {
             const checked = this.checked;
@@ -1042,11 +1133,27 @@
             toast.innerHTML = '<span class="gyp-toast-msg"></span>';
             document.body.appendChild(toast);
         }
+        if (toast._timeoutId) {
+            clearTimeout(toast._timeoutId);
+            toast._timeoutId = null;
+        }
         toast.querySelector('.gyp-toast-msg').textContent = message;
         toast.className = 'gyp-toast gyp-toast-show gyp-toast-' + type;
-        setTimeout(function() {
+        toast._timeoutId = setTimeout(function() {
             toast.className = 'gyp-toast';
+            toast._timeoutId = null;
         }, duration);
+    }
+
+    function hideToast() {
+        const toast = document.getElementById('gyp-toast');
+        if (toast) {
+            if (toast._timeoutId) {
+                clearTimeout(toast._timeoutId);
+                toast._timeoutId = null;
+            }
+            toast.className = 'gyp-toast';
+        }
     }
 
     function showModal() {
@@ -1179,7 +1286,7 @@
         }
     }
 
-    function fetchWithTimeout(url, options, timeout, signal) {
+    function gmFetchWithTimeout(url, options, timeout, signal) {
         return new Promise(function(resolve, reject) {
             const timeoutId = setTimeout(function() {
                 reject(new Error('请求超时'));
@@ -1223,35 +1330,18 @@
             throw new Error('请求已取消');
         }
 
-        const traceId = Math.random().toString(16).substr(2, 32);
-        const spanId = Date.now().toString(16);
-        const traceparent = '00-' + traceId + '-' + spanId + '-01';
-
         let lastError;
         for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
             if (signal && signal.aborted) {
                 throw new Error('请求已取消');
             }
             try {
-                const response = await fetchWithTimeout(API_URL, {
+                const response = await gmFetchWithTimeout(API_URL, {
                     method: 'POST',
                     headers: {
                         'Accept': 'application/json, text/plain, */*',
-                        'Accept-Language': 'zh-CN,zh;q=0.9',
                         'Authorization': authHeader,
-                        'Content-Type': 'application/json',
-                        'Origin': 'https://www.guangyapan.com',
-                        'Referer': 'https://www.guangyapan.com/',
-                        'did': generateDid(),
-                        'dt': '4',
-                        'Sec-Ch-Ua': '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
-                        'Sec-Ch-Ua-Mobile': '?0',
-                        'Sec-Ch-Ua-Platform': '"Windows"',
-                        'Sec-Fetch-Dest': 'empty',
-                        'Sec-Fetch-Mode': 'cors',
-                        'Sec-Fetch-Site': 'same-site',
-                        'Traceparent': traceparent,
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36'
+                        'Content-Type': 'application/json'
                     },
                     body: JSON.stringify({ fileId: fileId })
                 }, FETCH_TIMEOUT, signal);
@@ -1567,7 +1657,7 @@
             // 关闭按钮 - 沉稳灰蓝渐变
             '.gyp-selected-bar #gyp-modal-close-btn { background: linear-gradient(135deg, #4b6cb7 0%, #182848 100%); border: none; color: #fff; font-size: 13px; font-weight: 600; padding: 7px 16px; box-shadow: 0 4px 12px rgba(24, 40, 72, 0.4); transition: all 0.3s ease; }',
             '.gyp-selected-bar #gyp-modal-close-btn:hover { background: linear-gradient(135deg, #5b7cc7 0%, #283858 100%); box-shadow: 0 6px 16px rgba(24, 40, 72, 0.5); transform: translateY(-2px); }',
-            '.gyp-btn { padding: 8px 20px; font-size: 14px; border-radius: 4px; cursor: pointer; border: 1px solid #d9d9d9; background: #fff; color: #333; transition: all 0.2s ease; }',
+            '.gyp-btn { display: inline-flex; align-items: center; padding: 8px 20px; font-size: 14px; border-radius: 4px; cursor: pointer; border: 1px solid #d9d9d9; background: #fff; color: #333; transition: all 0.2s ease; }',
             '.gyp-hidden { display: none !important; }',
             '.gyp-btn:hover { color: #1890ff; border-color: #1890ff; }',
             '.gyp-btn-primary { background: #1890ff; border-color: #1890ff; color: #fff; }',
@@ -1580,6 +1670,7 @@
             '.gyp-toast.gyp-toast-show { opacity: 1; }',
             '.gyp-toast.gyp-toast-warning { background: rgba(250, 173, 20, 0.95); }',
             '.gyp-toast.gyp-toast-error { background: rgba(255, 77, 79, 0.95); }',
+            '.gyp-toast.gyp-toast-success { background: rgba(34, 197, 94, 0.95); }',
             // Aria2 按钮样式
             '.gyp-btn-aria2 { background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%) !important; border: none !important; color: #fff !important; font-size: 13px !important; font-weight: 600 !important; padding: 7px 16px !important; box-shadow: 0 4px 12px rgba(56, 239, 125, 0.4); }',
             '.gyp-btn-aria2:hover { background: linear-gradient(135deg, #15b3a6 0%, #4ff88f 100%) !important; box-shadow: 0 6px 16px rgba(56, 239, 125, 0.5); transform: translateY(-1px); }',
