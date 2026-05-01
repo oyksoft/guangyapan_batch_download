@@ -23,7 +23,7 @@ https://greasyfork.org/zh-CN/scripts/575452-%E5%85%89%E9%B8%AD%E4%BA%91%E7%9B%98
 ### 方式二：手动安装
 
 1. 安装油猴扩展：[Tampermonkey](https://www.tampermonkey.net/)（Chrome、Firefox、Edge 等主流浏览器均支持）
-2. 点击脚本文件 `guangyupan_get_links.user.js`，复制全部内容
+2. 点击脚本文件 `guangyapan_batch_download.user.js`，复制全部内容
 3. 打开油猴扩展，点击左侧「+」号新建脚本
 4. 粘贴代码并保存
 
