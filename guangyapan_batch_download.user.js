@@ -2,7 +2,7 @@
 // @name         光鸭云盘 - 获取直链
 // @namespace    http://tampermonkey.net/
 // @author       快乐无极
-// @version      1.6
+// @version      1.7
 // @description  获取所选文件的直链地址
 // @match        https://www.guangyapan.com/*
 // @grant        GM.xmlHttpRequest
@@ -25,6 +25,11 @@
 
     let modalCreated = false;
     let abortController = null;
+    let fileListCache = null;
+    let fileListCacheTime = 0;
+    const FILE_LIST_CACHE_TTL = 2000;
+    let lastCleanTime = 0;
+    const CLEAN_INTERVAL = 5000;
 
     // 记录选中的文件
     const selectedFilesMap = new Map(); // fileId -> { name, addedAt }
@@ -40,6 +45,11 @@
 
     // 从 React DevTools 可以看到：FileList -> props -> dataSource 和 selectedItems
     function findFileListComponent() {
+        const now = Date.now();
+        if (fileListCache && (now - fileListCacheTime) < FILE_LIST_CACHE_TTL) {
+            return fileListCache;
+        }
+
         const roots = [];
 
         // 查找所有 React 容器
@@ -63,9 +73,6 @@
             if (fiber.memoizedProps) {
                 const props = fiber.memoizedProps;
                 if (props.selectedItems !== undefined || props.dataSource) {
-                    if (isFileList) {
-                        console.log('GYP: Found FileList with dataSource/selectedItems');
-                    }
                     return { props, type: 'memoizedProps', componentName: typeName };
                 }
             }
@@ -74,9 +81,6 @@
             if (fiber.pendingProps) {
                 const props = fiber.pendingProps;
                 if (props.selectedItems !== undefined || props.dataSource) {
-                    if (isFileList) {
-                        console.log('GYP: Found FileList with dataSource/selectedItems');
-                    }
                     return { props, type: 'pendingProps', componentName: typeName };
                 }
             }
@@ -85,9 +89,6 @@
             if (fiber.stateNode && typeof fiber.stateNode === 'object') {
                 const node = fiber.stateNode;
                 if (node.props && (node.props.selectedItems !== undefined || node.props.dataSource)) {
-                    if (isFileList) {
-                        console.log('GYP: Found FileList in stateNode.props');
-                    }
                     return { props: node.props, type: 'stateNode.props', componentName: typeName };
                 }
             }
@@ -105,10 +106,13 @@
             return null;
         };
 
-        console.log('GYP: Searching for FileList component, total roots:', roots.length);
         for (const { fiber } of roots) {
             const found = findFileList(fiber);
-            if (found) return found;
+            if (found) {
+                fileListCache = found;
+                fileListCacheTime = now;
+                return found;
+            }
         }
         return null;
     }
@@ -116,12 +120,10 @@
     function getSelectedItemsFromReact() {
         const result = findFileListComponent();
         if (!result) {
-            console.log('GYP: Could not find FileList component');
             return { ids: new Set(), names: new Set(), filesMap: new Map() };
         }
 
         const { props } = result;
-        console.log('GYP: FileList props keys:', Object.keys(props));
 
         const marker = { ids: new Set(), names: new Set(), filesMap: new Map() };
 
@@ -142,13 +144,6 @@
                     });
                 }
             });
-            console.log('GYP: dataSource has', marker.filesMap.size, 'items');
-            // 调试：打印第一个文件的所有字段
-            if (marker.filesMap.size > 0) {
-                const firstFile = marker.filesMap.values().next().value;
-                console.log('GYP: First file data:', JSON.stringify(firstFile));
-                console.log('GYP: First file fileSize:', firstFile.size);
-            }
         }
 
         // 获取 selectedItems（选中的文件 ID）
@@ -166,7 +161,6 @@
         }
 
         if (!selectedItems) {
-            console.log('GYP: No selectedItems found');
             return marker;
         }
 
@@ -204,7 +198,6 @@
             });
         }
 
-        console.log('GYP: Selected items from React:', marker.ids.size, 'IDs');
         return marker;
     }
 
@@ -240,14 +233,12 @@
         domMarker.ids.forEach(id => reactMarker.ids.add(id));
         domMarker.names.forEach(name => reactMarker.names.add(name));
 
-        console.log('GYP: Total selected IDs:', reactMarker.ids.size, 'Names:', reactMarker.names.size);
         return reactMarker;
     }
 
     // ========== 选中文件监听 ==========
 
     function setupCheckboxListener() {
-        // 监听表格 tbody 上的点击事件
         document.querySelectorAll('.ant-table-tbody').forEach(tbody => {
             tbody.addEventListener('click', (e) => {
                 const checkbox = e.target.closest('.ant-checkbox-input');
@@ -269,10 +260,15 @@
                     fileName = '文件_' + fileId;
                 }
 
-                // 从 React 数据获取文件大小
-                const reactMarker = getSelectedItemsFromReact();
-                const fileData = reactMarker.filesMap.get(fileId) || {};
-                const fileSize = fileData.size || 0;
+                let fileSize = 0;
+                if (fileListCache && fileListCache.props) {
+                    const props = fileListCache.props;
+                    const dataSource = props.dataSource || [];
+                    if (Array.isArray(dataSource)) {
+                        const fileData = dataSource.find(item => item && String(item.fileId) === fileId);
+                        if (fileData) fileSize = fileData.fileSize || 0;
+                    }
+                }
 
                 if (checkbox.checked) {
                     selectedFilesMap.set(fileId, { name: fileName.trim(), size: fileSize, addedAt: Date.now() });
@@ -282,27 +278,23 @@
             });
         });
 
-        // 监听全选按钮
         document.querySelectorAll('.ant-table-header .ant-checkbox-input').forEach(checkbox => {
             checkbox.addEventListener('click', (e) => {
                 setTimeout(() => {
                     if (e.target.checked) {
-                        // 全选时，先清空再用 React 状态获取
                         selectedFilesMap.clear();
                         const marker = getSelectedFileIdsFromFramework();
-                        // 从 DOM 补充获取当前可见的
                         document.querySelectorAll('.ant-table-row-selected').forEach(row => {
                             const fileId = row.getAttribute('data-row-key');
                             if (fileId) {
                                 const nameDiv = row.querySelector('.ant-table-cell:nth-child(2) [title]') ||
                                 row.querySelector('.ant-table-cell:nth-child(2)');
                                 const name = nameDiv ? (nameDiv.getAttribute('title') || nameDiv.textContent) : ('文件_' + fileId);
-                                const fileData = marker.filesMap.get(fileId) || {};
-                                const fileSize = fileData.size || 0;
+                                const fileData = marker.filesMap ? marker.filesMap.get(fileId) : null;
+                                const fileSize = fileData ? (fileData.size || 0) : 0;
                                 selectedFilesMap.set(fileId, { name: name.trim(), size: fileSize, addedAt: Date.now() });
                             }
                         });
-                        console.log('GYP: Select all, map size:', selectedFilesMap.size);
                     } else {
                         selectedFilesMap.clear();
                     }
@@ -317,7 +309,6 @@
             name: data.name,
             size: data.size || 0
         }));
-        console.log('GYP: Selected files from map:', files.length);
         return files;
     }
 
@@ -334,9 +325,6 @@
                 cleaned++;
             }
         });
-        if (cleaned > 0) {
-            console.log('GYP: Cleaned expired selections:', cleaned);
-        }
     }
 
     // 动态生成设备ID
@@ -384,7 +372,6 @@
             });
 
             const selected = candidates[0];
-            console.log('GYP: Selected token from:', selected.key, 'score:', selected.score);
             return selected.token;
         } catch (e) {
             console.error('GYP: Error getting token:', e);
@@ -414,18 +401,6 @@
 
     const ARIA2_STORAGE_KEY = 'gyp_aria2_config';
 
-    function loadAria2Config() {
-        const saved = localStorage.getItem(ARIA2_STORAGE_KEY);
-        if (saved) {
-            try {
-                return JSON.parse(saved);
-            } catch (e) {
-                return { rpc: '', secret: '' };
-            }
-        }
-        return { rpc: '', secret: '' };
-    }
-
     function getAria2Config() {
         const saved = localStorage.getItem(ARIA2_STORAGE_KEY);
         if (saved) {
@@ -437,6 +412,8 @@
         }
         return { rpc: '', secret: '' };
     }
+
+    const loadAria2Config = getAria2Config;
 
     function openAria2Modal() {
         // 清理旧弹窗
@@ -1168,13 +1145,16 @@
         document.getElementById('gyp-progress-percent').textContent = '0%';
         document.getElementById('gyp-progress-fill').style.width = '0%';
         document.getElementById('gyp-result-tbody').innerHTML = '';
-        document.getElementById('gyp-select-all').checked = false;
+        const selectAll = document.getElementById('gyp-select-all');
+        selectAll.checked = false;
+        selectAll.indeterminate = false;
         const errorInfo = document.getElementById('gyp-error-info');
         errorInfo.innerHTML = '';
         errorInfo.style.display = 'none';
         // 重置复制按钮为隐藏状态
         document.getElementById('gyp-copy-selected-name').classList.add('gyp-hidden');
         document.getElementById('gyp-copy-selected').classList.add('gyp-hidden');
+        document.getElementById('gyp-aria2-send-selected').classList.add('gyp-hidden');
         document.getElementById('gyp-selected-count').textContent = '已选择 0 项';
     }
 
@@ -1321,7 +1301,6 @@
 
     async function getDownloadUrl(fileId, fileSize, signal) {
         const authHeader = getAuthHeader();
-        console.log('GYP: authHeader:', authHeader ? authHeader.substring(0, 80) + '...' : 'null');
         if (!authHeader) {
             throw new Error('未登录或Token不存在');
         }
@@ -1382,7 +1361,6 @@
         const marker = getSelectedFileIdsFromFramework();
 
         if (marker.ids.size > 0) {
-            console.log('GYP: Using framework state, found', marker.ids.size, 'selected IDs');
             const files = [];
 
             marker.ids.forEach(id => {
@@ -1411,7 +1389,6 @@
 
                 // 跳过文件夹
                 if (isDir) {
-                    console.log('GYP: Skipping folder:', name);
                     return;
                 }
 
@@ -1421,7 +1398,6 @@
         }
 
         // Fallback: 从当前 DOM 获取
-        console.log('GYP: Falling back to DOM');
         const rows = document.querySelectorAll('.ant-table-row-selected');
         const files = [];
 
@@ -1432,7 +1408,6 @@
             // 检查是否是文件夹（通过图标判断）
             const folderIcon = row.querySelector('.swangpan-icon-typefolder, [class*="folder"]');
             if (folderIcon) {
-                console.log('GYP: Skipping folder from DOM:', fileId);
                 return;
             }
 
@@ -1442,7 +1417,6 @@
             files.push({ id: fileId, name: name.trim() });
         });
 
-        console.log('GYP: DOM found', files.length, 'files');
         return files;
     }
 
@@ -1588,7 +1562,6 @@
         btn.onclick = startFetch;
 
         btnContainer.insertBefore(btn, uploadBtn.nextSibling);
-        console.log('GYP: Button added successfully');
     }
 
     function addStyles() {
@@ -1597,7 +1570,7 @@
         const style = document.createElement('style');
         style.id = 'gyp-styles';
         style.textContent = [
-            '#gyp-modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.5); z-index: 999999; justify-content: center; align-items: flex-start; padding: 50px 0; overflow: auto; }',
+            '#gyp-modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.5); z-index: 999999; justify-content: center; align-items: center; overflow: auto; }',
             '.gyp-modal-v2 { background: #fff; border-radius: 8px; width: 900px !important; min-width: 900px !important; max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 4px 24px rgba(0, 0, 0, 0.2); overflow: hidden; user-select: text; -webkit-user-select: text; flex-shrink: 0; }',
             '.gyp-modal-header { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid #e8e8e8; flex-shrink: 0; }',
             '.gyp-modal-title { font-size: 16px; font-weight: 500; color: #333; }',
@@ -1728,8 +1701,12 @@
                     tryInit();
                 }
             }
-            // 定期清理过期的选中记录
-            cleanExpiredSelections();
+            // 定期清理过期的选中记录（带节流）
+            const now = Date.now();
+            if (now - lastCleanTime > CLEAN_INTERVAL) {
+                lastCleanTime = now;
+                cleanExpiredSelections();
+            }
         });
 
         observer.observe(document.body || document.documentElement, {

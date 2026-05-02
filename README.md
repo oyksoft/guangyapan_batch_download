@@ -56,6 +56,15 @@ https://greasyfork.org/zh-CN/scripts/575452-%E5%85%89%E9%B8%AD%E4%BA%91%E7%9B%98
 
 ## 更新日志
 
+### v1.7 - 性能优化与细节修复
+- ⚡ **React 组件缓存** - `findFileListComponent` 添加 2 秒 TTL 缓存，减少频繁 DOM 遍历
+- 🔽 **checkbox 事件优化** - 点击时直接使用缓存数据获取文件大小，减少重复调用
+- ⏱️ **清理函数节流** - `cleanExpiredSelections` 调用间隔从"每次变化"改为"至少 5 秒"
+- 📐 **弹窗垂直居中** - 获取直链弹窗现在垂直居中显示
+- 🔧 **状态重置修复** - 重新打开弹窗时，全选复选框和"下载选中"按钮正确重置
+- 🔄 **合并重复函数** - `loadAria2Config` 和 `getAria2Config` 合并为同一个函数
+- 🗑️ **移除调试日志** - 删除所有开发时的 console.log 输出
+
 ### v1.6 - Firefox 兼容性与 UI 优化
 - 🐛 **修复 Firefox 无法获取链接** - 解决 Firefox 浏览器下无法获取文件直链的问题
 - 💡 **授权提示** - 非 localhost/127.0.0.1 域名发送 Aria2 时提示选择"总是允许"，一劳永逸
