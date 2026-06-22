@@ -2,8 +2,8 @@
 // @name         光鸭云盘 - 获取直链
 // @namespace    http://tampermonkey.net/
 // @author       快乐无极
-// @version      1.7
-// @description  获取所选文件的直链地址
+// @version      1.8
+// @description  获取所选文件的直链地址，支持勾选目录自动递归获取子文件
 // @match        https://www.guangyapan.com/*
 // @grant        GM.xmlHttpRequest
 // @connect      localhost
@@ -33,6 +33,67 @@
 
     // 记录选中的文件
     const selectedFilesMap = new Map(); // fileId -> { name, addedAt }
+
+    // ========== 目录递归相关 ==========
+    const LIST_API_URL = 'https://api.guangyapan.com/nd.bizuserres.s/v1/file/get_file_list';
+    const DIR_PAGE_SIZE = 100;
+    const DIR_MAX_PAGES = 50; // 每个目录最多翻50页
+    const DIR_REQUEST_DELAY = 200;
+    let capturedListHeaders = null;
+    let dirScanAbortController = null;
+    let cachedScanResult = null; // 缓存目录扫描结果，避免重复遍历
+
+    // ========== 文件类型分类 ==========
+    const FILE_CATEGORIES = {
+        '视频': {
+            extensions: ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts', '.rmvb', '.rm', '.3gp', '.m2ts', '.vob', '.ogv', '.divx'],
+            icon: '🎬',
+            color: '#f5576c'
+        },
+        '图片': {
+            extensions: ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.ico', '.heic', '.heif', '.tiff', '.tif', '.raw', '.psd', '.ai'],
+            icon: '🖼️',
+            color: '#667eea'
+        },
+        '压缩包': {
+            extensions: ['.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.iso', '.tgz', '.tbz2', '.zst', '.lz4', '.cab', '.arj'],
+            icon: '📦',
+            color: '#f5af19'
+        },
+        '文档': {
+            extensions: ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt', '.csv', '.md', '.epub', '.mobi', '.azw3', '.chm', '.html', '.htm', '.xml', '.json'],
+            icon: '📄',
+            color: '#11998e'
+        },
+        '音频': {
+            extensions: ['.mp3', '.flac', '.aac', '.ogg', '.wav', '.wma', '.m4a', '.ape', '.opus', '.ac3', '.dts', '.aiff', '.alac'],
+            icon: '🎵',
+            color: '#764ba2'
+        }
+    };
+
+    // 根据文件名判断分类
+    function getFileCategory(fileName) {
+        const ext = '.' + (fileName || '').split('.').pop().toLowerCase();
+        for (const [category, info] of Object.entries(FILE_CATEGORIES)) {
+            if (info.extensions.includes(ext)) return category;
+        }
+        return '其他';
+    }
+
+    function parseSizeInput(value, unit) {
+        // unit: 'B', 'KB', 'MB', 'GB', 'TB'
+        const num = parseFloat(value);
+        if (isNaN(num) || num < 0) return 0;
+        const multipliers = { 'B': 1, 'KB': 1024, 'MB': 1048576, 'GB': 1073741824, 'TB': 1099511627776 };
+        return Math.floor(num * (multipliers[unit] || 1));
+    }
+
+    function bytesToUnit(bytes, unit) {
+        const multipliers = { 'B': 1, 'KB': 1024, 'MB': 1048576, 'GB': 1073741824, 'TB': 1099511627776 };
+        const divider = multipliers[unit] || 1;
+        return bytes / divider;
+    }
 
     // ========== React 内部状态获取选中项 ==========
 
@@ -384,6 +445,100 @@
         if (!token) return null;
         if (token.startsWith('Bearer ')) return token;
         return 'Bearer ' + token;
+    }
+
+    // ========== XHR 拦截器：捕获列表API请求头 ==========
+
+    function setupListHeaderCapture() {
+        if (window._gyp_list_capture_setup) return;
+        window._gyp_list_capture_setup = true;
+
+        const origOpen = XMLHttpRequest.prototype.open;
+        const origSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+        XMLHttpRequest.prototype.open = function(method, url) {
+            this._gyp_url = url;
+            this._gyp_method = method;
+            return origOpen.apply(this, arguments);
+        };
+
+        XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+            if (this._gyp_url && /get_file_list|bizuserres|guangyapan/i.test(this._gyp_url)) {
+                if (!this._gyp_headers) this._gyp_headers = {};
+                this._gyp_headers[name.toLowerCase()] = value;
+            }
+            return origSetRequestHeader.apply(this, arguments);
+        };
+
+        // 拦截 fetch 请求
+        const origFetch = window.fetch;
+        window.fetch = function(input, init) {
+            if (typeof input === 'string' && /get_file_list|bizuserres|guangyapan/i.test(input)) {
+                if (init && init.headers) {
+                    const headers = {};
+                    if (init.headers instanceof Headers) {
+                        init.headers.forEach((value, key) => {
+                            headers[key.toLowerCase()] = value;
+                        });
+                    } else if (Array.isArray(init.headers)) {
+                        init.headers.forEach(([key, value]) => {
+                            headers[key.toLowerCase()] = value;
+                        });
+                    } else if (typeof init.headers === 'object') {
+                        Object.entries(init.headers).forEach(([key, value]) => {
+                            headers[key.toLowerCase()] = value;
+                        });
+                    }
+                    if (headers.authorization) {
+                        updateCapturedHeaders(headers);
+                    }
+                }
+            }
+            return origFetch.apply(this, arguments);
+        };
+    }
+
+    function updateCapturedHeaders(headers) {
+        if (!capturedListHeaders) {
+            capturedListHeaders = {};
+        }
+        const forwardKeys = ['authorization', 'did', 'dt', 'appid', 'timestamp', 'signature', 'nonce'];
+        forwardKeys.forEach(key => {
+            if (headers[key] && !capturedListHeaders[key]) {
+                capturedListHeaders[key] = headers[key];
+            }
+        });
+    }
+
+    function getListApiHeaders() {
+        setupListHeaderCapture();
+
+        const authHeader = getAuthHeader();
+        const base = {};
+
+        if (authHeader) {
+            base['authorization'] = authHeader;
+        }
+
+        // 合并捕获的头信息
+        if (capturedListHeaders) {
+            Object.assign(base, capturedListHeaders);
+        }
+
+        // 尝试从 localStorage 获取 did/dt
+        if (!base['did']) {
+            const storedDid = localStorage.getItem('did') || localStorage.getItem('device_id') || localStorage.getItem('Device-Id');
+            if (storedDid) base['did'] = storedDid;
+        }
+        if (!base['dt']) {
+            const storedDt = localStorage.getItem('dt') || localStorage.getItem('device_type');
+            if (storedDt) base['dt'] = storedDt;
+        }
+
+        base['accept'] = 'application/json, text/plain, */*';
+        base['content-type'] = 'application/json';
+
+        return base;
     }
 
     function findUploadButton() {
@@ -954,6 +1109,7 @@
             '<span id="gyp-selected-count">已选择 0 项</span>' +
             '<button class="gyp-btn gyp-btn-sm gyp-hidden" id="gyp-copy-selected-name">复制文件名</button>' +
             '<button class="gyp-btn gyp-btn-sm gyp-hidden" id="gyp-copy-selected">复制直链</button>' +
+            '<button class="gyp-btn gyp-btn-sm gyp-hidden" id="gyp-refilter-btn" title="使用缓存数据重新筛选，无需重新扫描目录">🔍 重新筛选</button>' +
             '</div>' +
             '<div class="gyp-selected-right">' +
             '<button class="gyp-btn gyp-btn-aria2 gyp-hidden" id="gyp-aria2-send-selected"><span style="display:inline-flex;align-items:center;gap:4px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>下载选中</span></button>' +
@@ -983,6 +1139,7 @@
         modal.querySelector('#gyp-copy-selected').onclick = copySelectedUrls;
         modal.querySelector('#gyp-copy-selected-name').onclick = copySelectedNames;
         modal.querySelector('#gyp-deselect-selected').onclick = deselectAll;
+        modal.querySelector('#gyp-refilter-btn').onclick = reopenFilterFromCache;
 
         // Aria2 事件处理
         modal.querySelector('#gyp-aria2-config').onclick = openAria2Modal;
@@ -1087,16 +1244,24 @@
 
     function closeModal() {
         cancelFetch();
+        cachedScanResult = null; // 关闭弹窗时清空缓存
         const modal = document.getElementById('gyp-modal-overlay');
         if (modal) {
             modal.style.display = 'none';
         }
+        // 隐藏重新筛选按钮
+        const refilterBtn = document.getElementById('gyp-refilter-btn');
+        if (refilterBtn) { refilterBtn.classList.add('gyp-hidden'); }
     }
 
     function cancelFetch() {
         if (abortController) {
             abortController.abort();
             abortController = null;
+        }
+        if (dirScanAbortController) {
+            dirScanAbortController.abort();
+            dirScanAbortController = null;
         }
     }
 
@@ -1351,18 +1516,605 @@
         throw lastError || new Error('获取直链失败');
     }
 
+    // ========== 目录列表 API ==========
+
+    async function fetchFileListPage(parentId, pageIndex, pageSize, signal) {
+        if (signal && signal.aborted) {
+            throw new Error('请求已取消');
+        }
+
+        const headers = getListApiHeaders();
+
+        const requestBody = {
+            parentId: String(parentId || '').trim(),
+            pageSize: pageSize || DIR_PAGE_SIZE,
+            orderBy: 0,
+            sortType: 0
+        };
+        if (pageIndex > 0) {
+            requestBody.page = pageIndex + 1;
+        }
+
+        let lastError;
+        for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            if (signal && signal.aborted) {
+                throw new Error('请求已取消');
+            }
+            try {
+                const response = await gmFetchWithTimeout(LIST_API_URL, {
+                    method: 'POST',
+                    headers: headers,
+                    body: JSON.stringify(requestBody)
+                }, FETCH_TIMEOUT, signal);
+
+                if (!response.ok) {
+                    throw new Error('请求失败: ' + response.status);
+                }
+
+                const data = await response.json();
+                if (data.msg === 'success' && data.data) {
+                    // data.data 可能直接是数组或者是 { list: [], ... } 结构
+                    const items = Array.isArray(data.data) ? data.data : (data.data.list || data.data.items || []);
+                    return {
+                        items: items,
+                        hasMore: items.length >= (pageSize || DIR_PAGE_SIZE)
+                    };
+                } else {
+                    throw new Error(data.msg || '获取文件列表失败');
+                }
+            } catch (err) {
+                lastError = err;
+                if (err.message === '请求已取消') {
+                    throw err;
+                }
+                if (attempt < MAX_RETRIES - 1) {
+                    const delay = RETRY_BASE_DELAY * Math.pow(2, attempt);
+                    await sleep(delay);
+                }
+            }
+        }
+
+        throw lastError || new Error('获取文件列表失败');
+    }
+
+    async function fetchAllFilesInDir(parentId, dirName, options) {
+        options = options || {};
+        const signal = options.signal;
+        const pageSize = DIR_PAGE_SIZE;
+        const maxPages = options.maxPages || DIR_MAX_PAGES;
+        const onProgress = options.onProgress;
+
+        const allFiles = [];
+        const allDirs = [];
+        const seenIds = new Set();
+
+        for (let pageIndex = 0; pageIndex < maxPages; pageIndex++) {
+            if (signal && signal.aborted) {
+                return { files: allFiles, dirs: allDirs, aborted: true };
+            }
+
+            const result = await fetchFileListPage(parentId, pageIndex, pageSize, signal);
+            const items = result.items;
+
+            if (!items.length) break;
+
+            let newCount = 0;
+            for (const item of items) {
+                const fileId = String(item.fileId || '');
+                if (!fileId || seenIds.has(fileId)) continue;
+                seenIds.add(fileId);
+
+                const resType = item.resType;
+                const isDir = resType === 2;
+
+                if (isDir) {
+                    allDirs.push({
+                        fileId: fileId,
+                        fileName: item.fileName || item.name || '',
+                        dirId: item.dirId || fileId
+                    });
+                } else {
+                    allFiles.push({
+                        id: fileId,
+                        name: item.fileName || item.name || '',
+                        size: item.fileSize || item.size || 0
+                    });
+                }
+                newCount++;
+            }
+
+            if (onProgress) {
+                onProgress({ dirName: dirName, filesFound: allFiles.length, dirsFound: allDirs.length, page: pageIndex + 1 });
+            }
+
+            if (!result.hasMore || items.length < pageSize) break;
+
+            if (DIR_REQUEST_DELAY > 0) {
+                await sleep(DIR_REQUEST_DELAY);
+            }
+        }
+
+        return { files: allFiles, dirs: allDirs, aborted: false };
+    }
+
+    async function collectAllFilesRecursive(dirIds, dirNames, options) {
+        options = options || {};
+        const signal = options.signal;
+        const onProgress = options.onProgress;
+        const maxDepth = options.maxDepth || 20;
+
+        const allFiles = [];
+        const processedDirs = new Set();
+        const errors = [];
+        let aborted = false;
+
+        // BFS 队列: { dirId, dirName, depth, path }
+        const queue = dirIds.map((dirId, i) => ({
+            dirId: String(dirId || ''),
+            dirName: dirNames[i] || '文件夹_' + dirId,
+            depth: 0,
+            path: dirNames[i] || '文件夹_' + dirId
+        }));
+
+        while (queue.length > 0) {
+            if (signal && signal.aborted) {
+                aborted = true;
+                break;
+            }
+
+            const current = queue.shift();
+            const dirKey = current.dirId;
+
+            if (processedDirs.has(dirKey)) continue;
+            processedDirs.add(dirKey);
+
+            try {
+                const result = await fetchAllFilesInDir(current.dirId, current.dirName, {
+                    signal: signal,
+                    maxPages: DIR_MAX_PAGES,
+                    onProgress: (info) => {
+                        if (onProgress) {
+                            onProgress({
+                                dirName: current.dirName,
+                                path: current.path,
+                                depth: current.depth,
+                                filesFound: allFiles.length,
+                                dirsFound: queue.length,
+                                page: info.page
+                            });
+                        }
+                    }
+                });
+
+                if (result.aborted) {
+                    aborted = true;
+                    break;
+                }
+
+                // 添加找到的文件
+                allFiles.push(...result.files);
+
+                // 将子目录加入队列
+                if (current.depth < maxDepth) {
+                    for (const subDir of result.dirs) {
+                        queue.push({
+                            dirId: subDir.fileId,
+                            dirName: subDir.fileName,
+                            depth: current.depth + 1,
+                            path: current.path + '/' + subDir.fileName
+                        });
+                    }
+                }
+
+                if (onProgress) {
+                    onProgress({
+                        dirName: current.dirName,
+                        path: current.path,
+                        depth: current.depth,
+                        filesFound: allFiles.length,
+                        dirsFound: queue.length,
+                        processedDirs: processedDirs.size,
+                        done: false
+                    });
+                }
+            } catch (err) {
+                console.error('GYP: Error scanning directory', current.dirName, ':', err.message);
+                errors.push({ dirName: current.dirName, path: current.path, error: err.message });
+            }
+        }
+
+        return {
+            files: allFiles,
+            errors: errors,
+            aborted: aborted,
+            processedDirs: processedDirs.size
+        };
+    }
+
+    // ========== 文件筛选弹窗 ==========
+
+    function showFileFilterModal(allFiles, onConfirm, onSkip) {
+        // 计算统计信息
+        const maxSize = allFiles.reduce((max, f) => Math.max(max, f.size || 0), 0);
+        const totalCount = allFiles.length;
+        const totalSize = allFiles.reduce((sum, f) => sum + (f.size || 0), 0);
+
+        // 分类统计
+        const categoryStats = {};
+        allFiles.forEach(f => {
+            const cat = getFileCategory(f.name);
+            if (!categoryStats[cat]) categoryStats[cat] = { count: 0, size: 0 };
+            categoryStats[cat].count++;
+            categoryStats[cat].size += (f.size || 0);
+        });
+
+        // 移除现有弹窗
+        const existing = document.getElementById('gyp-filter-overlay');
+        if (existing) existing.remove();
+
+        const overlay = document.createElement('div');
+        overlay.id = 'gyp-filter-overlay';
+        overlay.style.cssText = 'position: fixed; inset: 0; z-index: 10000001; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0.5);';
+
+        // 默认单位 MB
+        let filterState = {
+            minSize: 0,
+            maxSize: maxSize,
+            minInput: '0',
+            minUnit: 'MB',
+            maxInput: bytesToUnit(maxSize, 'MB').toFixed(2),
+            maxUnit: 'MB',
+            enabledCategories: {},
+            allFiles: allFiles
+        };
+        // 默认所有分类勾选
+        Object.keys(FILE_CATEGORIES).forEach(cat => { filterState.enabledCategories[cat] = true; });
+
+        function applyFilters() {
+            const minBytes = filterState.minSize;
+            const maxBytes = filterState.maxSize;
+            const enabledCats = Object.entries(filterState.enabledCategories)
+                .filter(([, v]) => v)
+                .map(([k]) => k);
+
+            const result = allFiles.filter(f => {
+                const size = f.size || 0;
+                if (size < minBytes || size > maxBytes) return false;
+                const cat = getFileCategory(f.name);
+                return enabledCats.includes(cat);
+            });
+
+            return result;
+        }
+
+        function updateStats() {
+            const filtered = applyFilters();
+            document.getElementById('gyp-filter-count').textContent = filtered.length + ' / ' + totalCount;
+            document.getElementById('gyp-filter-size').textContent = formatSize(filtered.reduce((sum, f) => sum + (f.size || 0), 0));
+            document.getElementById('gyp-filter-total-size').textContent = formatSize(totalSize);
+        }
+
+        function updateSliderLabels() {
+            document.getElementById('gyp-filter-min-label').textContent = formatSize(filterState.minSize);
+            document.getElementById('gyp-filter-max-label').textContent = filterState.maxSize >= maxSize ? formatSize(maxSize) + ' (全部)' : formatSize(filterState.maxSize);
+        }
+
+        function sliderFromBytes(bytes) {
+            if (maxSize <= 0) return 0;
+            // 对数刻度让滑块更易用
+            return Math.log(1 + bytes) / Math.log(1 + maxSize) * 100;
+        }
+
+        function bytesFromSlider(percent) {
+            if (maxSize <= 0) return 0;
+            return Math.round(Math.pow(1 + maxSize, percent / 100) - 1);
+        }
+
+        // 构建弹窗 HTML
+        const categoryToggles = Object.entries(FILE_CATEGORIES).map(([cat, info]) => {
+            const stats = categoryStats[cat] || { count: 0, size: 0 };
+            return (
+                '<label class="gyp-filter-cat-item" style="--cat-color:' + info.color + '">' +
+                '<input type="checkbox" class="gyp-filter-cat-check" data-cat="' + cat + '" checked>' +
+                '<span class="gyp-filter-cat-icon">' + info.icon + '</span>' +
+                '<span class="gyp-filter-cat-name">' + cat + '</span>' +
+                '<span class="gyp-filter-cat-count">' + stats.count + '个</span>' +
+                '</label>'
+            );
+        }).join('');
+
+        overlay.innerHTML =
+            '<div class="gyp-filter-modal">' +
+            // 头部
+            '<div class="gyp-filter-header">' +
+            '<span>📋 文件筛选</span>' +
+            '<button class="gyp-filter-close-btn" id="gyp-filter-close">×</button>' +
+            '</div>' +
+            // 主体
+            '<div class="gyp-filter-body">' +
+            // 统计概览
+            '<div class="gyp-filter-summary">' +
+            '<div class="gyp-filter-summary-item"><span class="gyp-summary-num">' + totalCount + '</span><span>个文件</span></div>' +
+            '<div class="gyp-filter-summary-item"><span class="gyp-summary-num" id="gyp-filter-total-size">' + formatSize(totalSize) + '</span><span>总计</span></div>' +
+            '<div class="gyp-filter-summary-item gyp-summary-active"><span class="gyp-summary-num" id="gyp-filter-count">' + totalCount + ' / ' + totalCount + '</span><span>筛选后</span></div>' +
+            '<div class="gyp-filter-summary-item gyp-summary-active"><span class="gyp-summary-num" id="gyp-filter-size">' + formatSize(totalSize) + '</span><span>筛选后大小</span></div>' +
+            '</div>' +
+            // 文件类型
+            '<div class="gyp-filter-section">' +
+            '<div class="gyp-filter-section-title">📂 文件类型</div>' +
+            '<div class="gyp-filter-cat-grid">' + categoryToggles +
+            '<label class="gyp-filter-cat-item" style="--cat-color:#999">' +
+            '<input type="checkbox" class="gyp-filter-cat-check" data-cat="其他" checked>' +
+            '<span class="gyp-filter-cat-icon">📁</span>' +
+            '<span class="gyp-filter-cat-name">其他</span>' +
+            '<span class="gyp-filter-cat-count">' + (categoryStats['其他'] ? categoryStats['其他'].count : 0) + '个</span>' +
+            '</label>' +
+            '</div>' +
+            '</div>' +
+            // 大小范围
+            '<div class="gyp-filter-section">' +
+            '<div class="gyp-filter-section-title">📏 文件大小范围</div>' +
+            '<div class="gyp-filter-range-inputs">' +
+            '<div class="gyp-filter-range-group">' +
+            '<span>最小</span>' +
+            '<input type="number" class="gyp-filter-size-input" id="gyp-filter-min-input" value="0" min="0" step="0.01">' +
+            '<select class="gyp-filter-unit-select" id="gyp-filter-min-unit">' +
+            '<option value="B">B</option><option value="KB">KB</option><option value="MB" selected>MB</option><option value="GB">GB</option><option value="TB">TB</option>' +
+            '</select>' +
+            '</div>' +
+            '<span class="gyp-filter-range-sep">~</span>' +
+            '<div class="gyp-filter-range-group">' +
+            '<span>最大</span>' +
+            '<input type="number" class="gyp-filter-size-input" id="gyp-filter-max-input" value="' + bytesToUnit(maxSize, 'MB').toFixed(2) + '" min="0" step="0.01">' +
+            '<select class="gyp-filter-unit-select" id="gyp-filter-max-unit">' +
+            '<option value="B">B</option><option value="KB">KB</option><option value="MB" selected>MB</option><option value="GB">GB</option><option value="TB">TB</option>' +
+            '</select>' +
+            '</div>' +
+            '</div>' +
+            // 滑块
+            '<div class="gyp-filter-slider-wrapper">' +
+            '<div class="gyp-filter-slider-labels">' +
+            '<span id="gyp-filter-min-label">0 B</span>' +
+            '<span id="gyp-filter-max-label">' + formatSize(maxSize) + '</span>' +
+            '</div>' +
+            '<div class="gyp-filter-dual-slider">' +
+            '<input type="range" class="gyp-filter-range" id="gyp-filter-range-min" min="0" max="100" value="0">' +
+            '<input type="range" class="gyp-filter-range" id="gyp-filter-range-max" min="0" max="100" value="100">' +
+            '<div class="gyp-filter-range-track" id="gyp-filter-range-track"></div>' +
+            '</div>' +
+            '<div class="gyp-filter-quick-sizes">' +
+            '<button class="gyp-filter-quick-btn" data-min="0" data-max="0">全部</button>' +
+            '<button class="gyp-filter-quick-btn" data-min="0" data-max="1048576">≤1MB</button>' +
+            '<button class="gyp-filter-quick-btn" data-min="1048576" data-max="10485760">1-10MB</button>' +
+            '<button class="gyp-filter-quick-btn" data-min="10485760" data-max="104857600">10-100MB</button>' +
+            '<button class="gyp-filter-quick-btn" data-min="104857600" data-max="1073741824">100MB-1GB</button>' +
+            '<button class="gyp-filter-quick-btn" data-min="1073741824" data-max="0">≥1GB</button>' +
+            '</div>' +
+            '</div>' +
+            '</div>' +
+            '</div>' +
+            // 底部按钮
+            '<div class="gyp-filter-footer">' +
+            '<button class="gyp-filter-btn-skip" id="gyp-filter-skip">跳过筛选，获取全部</button>' +
+            '<button class="gyp-filter-btn-reset" id="gyp-filter-reset">重置</button>' +
+            '<button class="gyp-filter-btn-cancel" id="gyp-filter-cancel">取消</button>' +
+            '<button class="gyp-filter-btn-confirm" id="gyp-filter-confirm">确认获取直链</button>' +
+            '</div>' +
+            '</div>';
+
+        document.body.appendChild(overlay);
+
+        // 绑定事件
+        const closeModal = () => { overlay.remove(); };
+        document.getElementById('gyp-filter-close').onclick = closeModal;
+        document.getElementById('gyp-filter-cancel').onclick = closeModal;
+        overlay.addEventListener('click', function(e) {
+            if (e.target === overlay) closeModal();
+        });
+
+        // 确认按钮
+        document.getElementById('gyp-filter-confirm').onclick = function() {
+            const filtered = applyFilters();
+            if (filtered.length === 0) {
+                showToast('筛选结果为空，请调整筛选条件', 2000, 'warning');
+                return;
+            }
+            overlay.remove();
+            onConfirm(filtered);
+        };
+
+        // 跳过按钮 — 直接获取全部，不筛选
+        document.getElementById('gyp-filter-skip').onclick = function() {
+            overlay.remove();
+            if (onSkip) {
+                onSkip(allFiles);
+            } else {
+                onConfirm(allFiles);
+            }
+        };
+
+        // 重置按钮
+        document.getElementById('gyp-filter-reset').onclick = function() {
+            filterState.minSize = 0;
+            filterState.maxSize = maxSize;
+            filterState.minInput = '0';
+            filterState.minUnit = 'MB';
+            filterState.maxInput = bytesToUnit(maxSize, 'MB').toFixed(2);
+            filterState.maxUnit = 'MB';
+            Object.keys(FILE_CATEGORIES).forEach(cat => { filterState.enabledCategories[cat] = true; });
+            filterState.enabledCategories['其他'] = true;
+
+            // 更新 UI
+            document.getElementById('gyp-filter-range-min').value = 0;
+            document.getElementById('gyp-filter-range-max').value = 100;
+            document.getElementById('gyp-filter-min-input').value = '0';
+            document.getElementById('gyp-filter-max-input').value = bytesToUnit(maxSize, 'MB').toFixed(2);
+            document.getElementById('gyp-filter-min-unit').value = 'MB';
+            document.getElementById('gyp-filter-max-unit').value = 'MB';
+            document.querySelectorAll('.gyp-filter-cat-check').forEach(cb => { cb.checked = true; });
+            updateSliderLabels();
+            updateStats();
+            updateRangeTrack();
+        };
+
+        // 分类勾选
+        document.querySelectorAll('.gyp-filter-cat-check').forEach(cb => {
+            cb.addEventListener('change', function() {
+                const cat = this.getAttribute('data-cat');
+                if (cat) {
+                    filterState.enabledCategories[cat] = this.checked;
+                    updateStats();
+                }
+            });
+        });
+
+        // 大小滑块
+        const rangeMin = document.getElementById('gyp-filter-range-min');
+        const rangeMax = document.getElementById('gyp-filter-range-max');
+
+        function updateRangeTrack() {
+            const minVal = parseInt(rangeMin.value);
+            const maxVal = parseInt(rangeMax.value);
+            if (minVal > maxVal) return;
+            const track = document.getElementById('gyp-filter-range-track');
+            track.style.left = minVal + '%';
+            track.style.width = (maxVal - minVal) + '%';
+        }
+
+        function syncSlidersToState() {
+            rangeMin.value = Math.round(sliderFromBytes(filterState.minSize));
+            rangeMax.value = Math.round(sliderFromBytes(filterState.maxSize));
+            updateRangeTrack();
+            updateSliderLabels();
+            updateStats();
+        }
+
+        function syncInputsToState() {
+            document.getElementById('gyp-filter-min-input').value = filterState.minInput;
+            document.getElementById('gyp-filter-min-unit').value = filterState.minUnit;
+            document.getElementById('gyp-filter-max-input').value = filterState.maxInput;
+            document.getElementById('gyp-filter-max-unit').value = filterState.maxUnit;
+        }
+
+        rangeMin.addEventListener('input', function() {
+            let val = parseInt(this.value);
+            if (val >= parseInt(rangeMax.value)) {
+                val = parseInt(rangeMax.value) - 1;
+                this.value = Math.max(0, val);
+            }
+            filterState.minSize = bytesFromSlider(parseInt(this.value));
+            filterState.minInput = bytesToUnit(filterState.minSize, filterState.minUnit).toFixed(2);
+            updateRangeTrack();
+            updateSliderLabels();
+            updateStats();
+            syncInputsToState();
+        });
+
+        rangeMax.addEventListener('input', function() {
+            let val = parseInt(this.value);
+            if (val <= parseInt(rangeMin.value)) {
+                val = parseInt(rangeMin.value) + 1;
+                this.value = Math.min(100, val);
+            }
+            filterState.maxSize = bytesFromSlider(parseInt(this.value));
+            filterState.maxInput = bytesToUnit(filterState.maxSize, filterState.maxUnit).toFixed(2);
+            updateRangeTrack();
+            updateSliderLabels();
+            updateStats();
+            syncInputsToState();
+        });
+
+        // 手动输入大小
+        document.getElementById('gyp-filter-min-input').addEventListener('input', function() {
+            const unit = document.getElementById('gyp-filter-min-unit').value;
+            const bytes = parseSizeInput(this.value, unit);
+            filterState.minSize = bytes;
+            filterState.minInput = this.value;
+            filterState.minUnit = unit;
+            syncSlidersToState();
+        });
+
+        document.getElementById('gyp-filter-min-unit').addEventListener('change', function() {
+            const val = parseFloat(document.getElementById('gyp-filter-min-input').value);
+            if (!isNaN(val) && val >= 0) {
+                const bytes = parseSizeInput(val, this.value);
+                filterState.minSize = bytes;
+                filterState.minUnit = this.value;
+            }
+            syncSlidersToState();
+        });
+
+        document.getElementById('gyp-filter-max-input').addEventListener('input', function() {
+            const unit = document.getElementById('gyp-filter-max-unit').value;
+            const bytes = parseSizeInput(this.value, unit);
+            filterState.maxSize = bytes || maxSize;
+            filterState.maxInput = this.value;
+            filterState.maxUnit = unit;
+            syncSlidersToState();
+        });
+
+        document.getElementById('gyp-filter-max-unit').addEventListener('change', function() {
+            const val = parseFloat(document.getElementById('gyp-filter-max-input').value);
+            if (!isNaN(val) && val >= 0) {
+                const bytes = parseSizeInput(val, this.value);
+                filterState.maxSize = bytes || maxSize;
+                filterState.maxUnit = this.value;
+            }
+            syncSlidersToState();
+        });
+
+        // 快捷大小按钮
+        document.querySelectorAll('.gyp-filter-quick-btn').forEach(btn => {
+            btn.addEventListener('click', function() {
+                const minBytes = parseInt(this.getAttribute('data-min'));
+                const maxBytesRaw = parseInt(this.getAttribute('data-max'));
+                const maxBytes = maxBytesRaw === 0 ? maxSize : maxBytesRaw;
+
+                filterState.minSize = minBytes;
+                filterState.maxSize = maxBytes;
+                filterState.minInput = bytesToUnit(minBytes, 'MB').toFixed(2);
+                filterState.minUnit = 'MB';
+                filterState.maxInput = bytesToUnit(maxBytes, 'MB').toFixed(2);
+                filterState.maxUnit = 'MB';
+
+                syncSlidersToState();
+                syncInputsToState();
+            });
+        });
+
+        // 初始化滑块轨道
+        updateRangeTrack();
+    }
+
     function getSelectedFiles() {
+        const result = getSelectedItemsWithFolders();
+        return result.files;
+    }
+
+    function getSelectedItemsWithFolders() {
+        const files = [];
+        const folders = [];
+
         // 优先使用 map 中记录的选中文件（用户点击过的）
         if (selectedFilesMap.size > 0) {
-            return getSelectedFilesFromMap();
+            const mapFiles = getSelectedFilesFromMap();
+            // selectedFilesMap 不区分文件和文件夹，需要通过 filesMap 来区分
+            const marker = getSelectedFileIdsFromFramework();
+            mapFiles.forEach(f => {
+                const fileData = marker.filesMap ? marker.filesMap.get(f.id) : null;
+                if (fileData && fileData.isDir) {
+                    folders.push({ id: f.id, name: f.name });
+                } else {
+                    files.push(f);
+                }
+            });
+            return { files, folders };
         }
 
         // 尝试从 React 状态获取选中项
         const marker = getSelectedFileIdsFromFramework();
 
         if (marker.ids.size > 0) {
-            const files = [];
-
             marker.ids.forEach(id => {
                 const idStr = String(id);
                 let name = null;
@@ -1387,37 +2139,36 @@
                     name = '文件_' + idStr;
                 }
 
-                // 跳过文件夹
                 if (isDir) {
-                    return;
+                    folders.push({ id: idStr, name });
+                } else {
+                    files.push({ id: idStr, name, size });
                 }
-
-                files.push({ id: idStr, name, size });
             });
-            return files;
+            return { files, folders };
         }
 
         // Fallback: 从当前 DOM 获取
         const rows = document.querySelectorAll('.ant-table-row-selected');
-        const files = [];
 
         rows.forEach(row => {
             const fileId = row.getAttribute('data-row-key');
             if (!fileId) return;
 
-            // 检查是否是文件夹（通过图标判断）
-            const folderIcon = row.querySelector('.swangpan-icon-typefolder, [class*="folder"]');
-            if (folderIcon) {
-                return;
-            }
-
             const nameDiv = row.querySelector('.ant-table-cell:nth-child(2) [title]') ||
                 row.querySelector('.ant-table-cell:nth-child(2)');
             const name = nameDiv ? (nameDiv.getAttribute('title') || nameDiv.textContent) : ('文件_' + fileId);
-            files.push({ id: fileId, name: name.trim() });
+
+            // 检查是否是文件夹（通过图标判断）
+            const folderIcon = row.querySelector('.swangpan-icon-typefolder, [class*="folder"]');
+            if (folderIcon) {
+                folders.push({ id: fileId, name: name.trim() });
+            } else {
+                files.push({ id: fileId, name: name.trim() });
+            }
         });
 
-        return files;
+        return { files, folders };
     }
 
     async function fetchWithConcurrency(files) {
@@ -1477,18 +2228,192 @@
         return { errors: errors, aborted: aborted };
     }
 
-    async function startFetch() {
-        // 从 map 或 DOM 获取选中的文件
-        const files = getSelectedFiles();
-
-        if (files.length === 0) {
-            showToast('请先选择要获取直链的文件', 2000, 'warning');
+    // 使用缓存数据重新打开筛选器（无需重新扫描目录）
+    function reopenFilterFromCache() {
+        if (!cachedScanResult || cachedScanResult.length === 0) {
+            showToast('暂无缓存的扫描数据，请重新选择文件夹获取', 2000, 'warning');
             return;
         }
 
+        // 清空现有结果表格
+        const tbody = document.getElementById('gyp-result-tbody');
+        if (tbody) { tbody.innerHTML = ''; }
+        const errorDiv = document.getElementById('gyp-error-info');
+        if (errorDiv) { errorDiv.innerHTML = ''; errorDiv.style.display = 'none'; }
+        const selectAll = document.getElementById('gyp-select-all');
+        if (selectAll) { selectAll.checked = false; selectAll.indeterminate = false; }
+        updateSelectedBar();
+        updateSelectAllState();
+
+        // 隐藏重新筛选按钮（筛选后会根据结果重新显示）
+        const refilterBtn = document.getElementById('gyp-refilter-btn');
+        if (refilterBtn) { refilterBtn.classList.add('gyp-hidden'); }
+
+        // 更新进度为筛选状态
+        document.getElementById('gyp-progress-text').textContent =
+            '已缓存 ' + cachedScanResult.length + ' 个文件 (总大小 ' + formatSize(cachedScanResult.reduce((s, f) => s + (f.size || 0), 0)) + ')，打开筛选器...';
+        document.getElementById('gyp-progress-fill').style.width = '100%';
+
+        // 打开筛选器
+        showFileFilterModal(cachedScanResult, function(filteredFiles) {
+            // 筛选后重新获取
+            cachedScanResult = filteredFiles; // 更新缓存为筛选结果
+            updateProgress(0, filteredFiles.length, '筛选完成：' + filteredFiles.length + ' 个文件，开始获取: 0/' + filteredFiles.length);
+            executeFetchWithFilteredFiles([...filteredFiles]);
+        }, function(allFiles) {
+            // 跳过筛选，获取全部缓存文件
+            updateProgress(0, allFiles.length, '开始获取全部: 0/' + allFiles.length);
+            executeFetchWithFilteredFiles([...allFiles]);
+        });
+    }
+
+    async function startFetch() {
+        // 从 map 或 DOM 获取选中的文件和文件夹
+        const selectedItems = getSelectedItemsWithFolders();
+        let files = selectedItems.files;
+        const folders = selectedItems.folders;
+
+        // 检查是否有选中的文件夹，提示用户
+        if (folders.length > 0) {
+            if (files.length === 0) {
+                // 只选了文件夹
+                const confirmed = confirm(
+                    '已选择了 ' + folders.length + ' 个文件夹：\n' +
+                    folders.map(f => '  - ' + f.name).join('\n') +
+                    '\n\n是否递归获取这些文件夹中的所有文件直链？\n\n（将自动遍历所有子目录）'
+                );
+                if (!confirmed) return;
+            } else {
+                // 同时选了文件和文件夹
+                const confirmed = confirm(
+                    '已选择了 ' + files.length + ' 个文件 和 ' + folders.length + ' 个文件夹：\n' +
+                    folders.map(f => '  - [文件夹] ' + f.name).slice(0, 5).join('\n') +
+                    (folders.length > 5 ? '\n  ... 等共 ' + folders.length + ' 个文件夹' : '') +
+                    '\n\n是否递归获取所有文件夹中的文件直链？\n\n（文件夹内的文件将和已选文件一起处理）'
+                );
+                if (!confirmed) {
+                    // 用户取消，仅处理已选文件
+                    files = selectedItems.files;
+                    folders.length = 0;
+                }
+            }
+        }
+
+        if (folders.length > 0) {
+            // 显示弹窗，先扫描目录
+            showModal();
+            updateProgress(0, 1, '正在扫描目录...');
+
+            dirScanAbortController = new AbortController();
+            const signal = dirScanAbortController.signal;
+
+            const dirNames = folders.map(f => f.name);
+            const dirIds = folders.map(f => f.id);
+
+            const scanResult = await collectAllFilesRecursive(dirIds, dirNames, {
+                signal: signal,
+                maxDepth: 20,
+                onProgress: (info) => {
+                    if (info.done) return;
+                    const statusText = info.path
+                        ? '扫描: ' + info.path + ' (已找到 ' + info.filesFound + ' 个文件, ' + info.processedDirs + ' 个目录已处理)'
+                        : '扫描目录中 (已找到 ' + info.filesFound + ' 个文件)...';
+                    updateProgress(0, 1, statusText);
+                }
+            });
+
+            dirScanAbortController = null;
+
+            if (scanResult.aborted) {
+                document.getElementById('gyp-progress-text').textContent = '目录扫描已取消';
+                document.getElementById('gyp-progress-fill').style.width = '100%';
+                showToast('目录扫描已取消', 3000, 'warning');
+                return;
+            }
+
+            // 合并文件夹中找到的文件和直接选中的文件（去重）
+            const existingIds = new Set(files.map(f => f.id));
+            let addedFromDirs = 0;
+            scanResult.files.forEach(f => {
+                if (!existingIds.has(f.id)) {
+                    files.push(f);
+                    existingIds.add(f.id);
+                    addedFromDirs++;
+                }
+            });
+
+            // 缓存扫描结果，方便后续重新筛选无需重新遍历
+            cachedScanResult = files.map(f => ({ ...f }));
+            const totalSize = files.reduce((sum, f) => sum + (f.size || 0), 0);
+
+            // 更新进度显示
+            document.getElementById('gyp-progress-text').textContent =
+                '目录扫描完成：共找到 ' + files.length + ' 个文件' +
+                ' (总大小 ' + formatSize(totalSize) + ')' +
+                (scanResult.errors.length > 0 ? ', ' + scanResult.errors.length + ' 个目录失败' : '') +
+                '，打开文件筛选器...';
+            document.getElementById('gyp-progress-fill').style.width = '100%';
+
+            if (scanResult.errors.length > 0) {
+                const errorDiv = document.getElementById('gyp-error-info');
+                errorDiv.innerHTML = '<strong>目录扫描警告 (' + scanResult.errors.length + '个):</strong><br>' +
+                    scanResult.errors.map(function(e) { return e.path + ': ' + e.error; }).join('<br>');
+                errorDiv.style.display = 'block';
+            }
+
+            if (files.length === 0) {
+                showToast('未找到任何可获取直链的文件', 3000, 'warning');
+                return;
+            }
+
+            // 弹出文件筛选器，支持"跳过筛选"直接获取全部
+            showFileFilterModal(files, function(filteredFiles) {
+                // 筛选确认：更新缓存并获取直链
+                cachedScanResult = filteredFiles; // 更新缓存为筛选后的结果
+                updateProgress(0, filteredFiles.length, '筛选完成：' + filteredFiles.length + ' 个文件，开始获取: 0/' + filteredFiles.length);
+                executeFetchWithFilteredFiles([...filteredFiles]);
+            }, function(allFiles) {
+                // 跳过筛选：保留原始缓存，直接获取全部
+                updateProgress(0, allFiles.length, '开始获取全部: 0/' + allFiles.length);
+                executeFetchWithFilteredFiles([...allFiles]);
+            });
+            return;
+        }
+
+        // 无文件夹时的纯文件模式
+        if (files.length === 0) {
+            showToast('请先选择要获取直链的文件或文件夹', 2000, 'warning');
+            return;
+        }
+
+        // 文件数量较多时也弹出筛选器方便用户过滤
+        if (files.length >= 20) {
+            showModal();
+            // 缓存文件列表
+            cachedScanResult = files.map(f => ({ ...f }));
+            const totalSize = files.reduce((sum, f) => sum + (f.size || 0), 0);
+            document.getElementById('gyp-progress-text').textContent =
+                '已选择 ' + files.length + ' 个文件 (总大小 ' + formatSize(totalSize) + ')，打开文件筛选器...';
+            document.getElementById('gyp-progress-fill').style.width = '100%';
+
+            showFileFilterModal(files, function(filteredFiles) {
+                cachedScanResult = filteredFiles;
+                updateProgress(0, filteredFiles.length, '筛选完成：' + filteredFiles.length + ' 个文件，开始获取: 0/' + filteredFiles.length);
+                executeFetchWithFilteredFiles([...filteredFiles]);
+            }, function(allFiles) {
+                updateProgress(0, allFiles.length, '开始获取全部: 0/' + allFiles.length);
+                executeFetchWithFilteredFiles([...allFiles]);
+            });
+            return;
+        }
+
+        // 少量文件直接获取（无缓存）
         showModal();
         updateProgress(0, files.length, '开始获取: 0/' + files.length);
+        executeFetchWithFilteredFiles(files);
+    }
 
+    async function executeFetchWithFilteredFiles(files) {
         const result = await fetchWithConcurrency(files);
 
         const total = files.length;
@@ -1508,8 +2433,10 @@
 
         if (result.errors.length > 0) {
             const errorDiv = document.getElementById('gyp-error-info');
-            errorDiv.innerHTML = '<strong>失败文件 (' + result.errors.length + '个):</strong><br>' +
+            const existingContent = errorDiv.innerHTML || '';
+            const newContent = '<strong>失败文件 (' + result.errors.length + '个):</strong><br>' +
                 result.errors.map(function(e) { return e.name + ': ' + e.error; }).join('<br>');
+            errorDiv.innerHTML = (existingContent ? existingContent + '<br>' : '') + newContent;
             errorDiv.style.display = 'block';
         }
 
@@ -1517,6 +2444,15 @@
             showToast('全部获取成功！');
         } else {
             showToast('获取完成，' + failCount + ' 个失败', 3000, 'warning');
+        }
+
+        // 如果有缓存数据，显示"重新筛选"按钮方便用户调整筛选条件后重新获取
+        if (cachedScanResult && cachedScanResult.length > 0) {
+            const refilterBtn = document.getElementById('gyp-refilter-btn');
+            if (refilterBtn) {
+                refilterBtn.classList.remove('gyp-hidden');
+                refilterBtn.title = '已缓存 ' + cachedScanResult.length + ' 个文件，点击可重新筛选无需扫描目录';
+            }
         }
     }
 
@@ -1630,6 +2566,9 @@
             // 关闭按钮 - 沉稳灰蓝渐变
             '.gyp-selected-bar #gyp-modal-close-btn { background: linear-gradient(135deg, #4b6cb7 0%, #182848 100%); border: none; color: #fff; font-size: 13px; font-weight: 600; padding: 7px 16px; box-shadow: 0 4px 12px rgba(24, 40, 72, 0.4); transition: all 0.3s ease; }',
             '.gyp-selected-bar #gyp-modal-close-btn:hover { background: linear-gradient(135deg, #5b7cc7 0%, #283858 100%); box-shadow: 0 6px 16px rgba(24, 40, 72, 0.5); transform: translateY(-2px); }',
+            // 重新筛选按钮 - 缓存复用
+            '.gyp-selected-bar #gyp-refilter-btn { background: linear-gradient(135deg, #38b2ac 0%, #319795 100%); border: none; color: #fff; font-size: 13px; font-weight: 600; padding: 7px 16px; box-shadow: 0 2px 8px rgba(49, 151, 149, 0.3); transition: all 0.3s ease; }',
+            '.gyp-selected-bar #gyp-refilter-btn:hover { background: linear-gradient(135deg, #4fd1c5 0%, #38b2ac 100%); box-shadow: 0 4px 12px rgba(49, 151, 149, 0.4); transform: translateY(-1px); }',
             '.gyp-btn { display: inline-flex; align-items: center; padding: 8px 20px; font-size: 14px; border-radius: 4px; cursor: pointer; border: 1px solid #d9d9d9; background: #fff; color: #333; transition: all 0.2s ease; }',
             '.gyp-hidden { display: none !important; }',
             '.gyp-btn:hover { color: #1890ff; border-color: #1890ff; }',
@@ -1663,8 +2602,59 @@
             '.gyp-aria2-form-group input::placeholder { color: #999 !important; user-select: none !important; }',
             '.gyp-aria2-form-group input:focus { border-color: #667eea; box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1); background-color: #fff; }',
             '.gyp-aria2-modal-actions { display: flex; gap: 12px; margin-top: 24px; }',
-            '.gyp-aria2-modal-actions .gyp-btn { flex: 1; padding: 12px 16px; font-size: 14px; }'
-	        ].join('\n');
+            '.gyp-aria2-modal-actions .gyp-btn { flex: 1; padding: 12px 16px; font-size: 14px; }',
+            // 文件筛选弹窗样式
+            '.gyp-filter-modal { background: #fff; border-radius: 12px; width: 720px; max-width: 95vw; max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 8px 40px rgba(0,0,0,0.25); overflow: hidden; user-select: none; }',
+            '.gyp-filter-header { display: flex; justify-content: space-between; align-items: center; padding: 18px 24px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; flex-shrink: 0; }',
+            '.gyp-filter-header span { font-size: 17px; font-weight: 600; }',
+            '.gyp-filter-close-btn { background: none; border: none; font-size: 26px; cursor: pointer; color: rgba(255,255,255,0.8); padding: 0; line-height: 1; }',
+            '.gyp-filter-close-btn:hover { color: #fff; }',
+            '.gyp-filter-body { padding: 20px 24px; overflow-y: auto; flex: 1; min-height: 0; }',
+            '.gyp-filter-summary { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }',
+            '.gyp-filter-summary-item { flex: 1; min-width: 100px; text-align: center; padding: 14px 10px; background: #f8f9fa; border-radius: 10px; border: 2px solid #e9ecef; }',
+            '.gyp-filter-summary-item span { display: block; font-size: 12px; color: #868e96; margin-top: 2px; }',
+            '.gyp-summary-num { font-size: 20px !important; font-weight: 700 !important; color: #495057 !important; }',
+            '.gyp-summary-active { border-color: #667eea; background: linear-gradient(135deg, #f0f4ff 0%, #e8edff 100%); }',
+            '.gyp-summary-active .gyp-summary-num { color: #667eea !important; }',
+            '.gyp-filter-section { margin-bottom: 20px; }',
+            '.gyp-filter-section-title { font-size: 15px; font-weight: 600; color: #333; margin-bottom: 12px; padding-left: 4px; }',
+            '.gyp-filter-cat-grid { display: flex; flex-wrap: wrap; gap: 8px; }',
+            '.gyp-filter-cat-item { display: flex; align-items: center; gap: 6px; padding: 8px 14px; border: 2px solid #e9ecef; border-radius: 8px; cursor: pointer; transition: all 0.2s; background: #fff; user-select: none; }',
+            '.gyp-filter-cat-item:hover { border-color: var(--cat-color, #999); }',
+            '.gyp-filter-cat-item:has(input:checked) { border-color: var(--cat-color, #667eea); background: color-mix(in srgb, var(--cat-color, #667eea) 8%, #fff); }',
+            '.gyp-filter-cat-check { width: 16px; height: 16px; cursor: pointer; accent-color: var(--cat-color, #667eea); }',
+            '.gyp-filter-cat-icon { font-size: 18px; }',
+            '.gyp-filter-cat-name { font-size: 13px; font-weight: 500; color: #495057; }',
+            '.gyp-filter-cat-count { font-size: 11px; color: #adb5bd; }',
+            '.gyp-filter-range-inputs { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }',
+            '.gyp-filter-range-group { display: flex; align-items: center; gap: 6px; flex: 1; }',
+            '.gyp-filter-range-group > span { font-size: 13px; color: #868e96; white-space: nowrap; }',
+            '.gyp-filter-size-input { width: 80px; padding: 6px 8px; border: 2px solid #e9ecef; border-radius: 6px; font-size: 13px; outline: none; text-align: right; background: #fff; color: #333; }',
+            '.gyp-filter-size-input:focus { border-color: #667eea; }',
+            '.gyp-filter-unit-select { padding: 6px 4px; border: 2px solid #e9ecef; border-radius: 6px; font-size: 13px; outline: none; background: #fff; cursor: pointer; }',
+            '.gyp-filter-unit-select:focus { border-color: #667eea; }',
+            '.gyp-filter-range-sep { font-size: 16px; color: #adb5bd; font-weight: 600; }',
+            '.gyp-filter-slider-wrapper { margin-bottom: 12px; }',
+            '.gyp-filter-slider-labels { display: flex; justify-content: space-between; font-size: 12px; color: #868e96; margin-bottom: 8px; }',
+            '.gyp-filter-dual-slider { position: relative; height: 24px; }',
+            '.gyp-filter-range { position: absolute; top: 0; left: 0; width: 100%; height: 24px; -webkit-appearance: none; appearance: none; background: transparent; pointer-events: none; z-index: 2; }',
+            '.gyp-filter-range::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 18px; height: 18px; border-radius: 50%; background: #667eea; border: 3px solid #fff; box-shadow: 0 2px 6px rgba(0,0,0,0.2); cursor: pointer; pointer-events: all; margin-top: -7px; }',
+            '.gyp-filter-range::-moz-range-thumb { width: 18px; height: 18px; border-radius: 50%; background: #667eea; border: 3px solid #fff; box-shadow: 0 2px 6px rgba(0,0,0,0.2); cursor: pointer; pointer-events: all; }',
+            '.gyp-filter-range-track { position: absolute; top: 8px; height: 6px; border-radius: 3px; background: linear-gradient(90deg, #667eea, #764ba2); z-index: 1; }',
+            '.gyp-filter-dual-slider::before { content: ""; position: absolute; top: 8px; left: 0; width: 100%; height: 6px; border-radius: 3px; background: #e9ecef; }',
+            '.gyp-filter-quick-sizes { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }',
+            '.gyp-filter-quick-btn { padding: 5px 12px; border: 1px solid #dee2e6; border-radius: 14px; background: #fff; font-size: 12px; color: #495057; cursor: pointer; transition: all 0.2s; }',
+            '.gyp-filter-quick-btn:hover { border-color: #667eea; color: #667eea; background: #f0f4ff; }',
+            '.gyp-filter-footer { display: flex; justify-content: flex-end; gap: 10px; padding: 16px 24px; border-top: 1px solid #e9ecef; flex-shrink: 0; }',
+            '.gyp-filter-btn-reset { padding: 10px 20px; border: 1px solid #dee2e6; border-radius: 8px; background: #fff; font-size: 14px; color: #495057; cursor: pointer; transition: all 0.2s; }',
+            '.gyp-filter-btn-reset:hover { border-color: #adb5bd; }',
+            '.gyp-filter-btn-cancel { padding: 10px 20px; border: 1px solid #dee2e6; border-radius: 8px; background: #fff; font-size: 14px; color: #868e96; cursor: pointer; transition: all 0.2s; }',
+            '.gyp-filter-btn-cancel:hover { border-color: #adb5bd; }',
+            '.gyp-filter-btn-skip { padding: 10px 24px; border: 2px solid #667eea; border-radius: 8px; background: #fff; font-size: 14px; font-weight: 600; color: #667eea; cursor: pointer; transition: all 0.2s; }',
+            '.gyp-filter-btn-skip:hover { background: #f0f4ff; border-color: #5a67d8; color: #5a67d8; }',
+            '.gyp-filter-btn-confirm { padding: 10px 24px; border: none; border-radius: 8px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); font-size: 14px; font-weight: 600; color: #fff; cursor: pointer; box-shadow: 0 4px 12px rgba(102,126,234,0.35); transition: all 0.3s; }',
+            '.gyp-filter-btn-confirm:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(102,126,234,0.45); }'
+            ].join('\n');
 
         document.head.appendChild(style);
     }
