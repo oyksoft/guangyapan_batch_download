@@ -2,7 +2,7 @@
 // @name         光鸭云盘 - 获取直链
 // @namespace    http://tampermonkey.net/
 // @author       快乐无极
-// @version      1.7
+// @version      1.8
 // @description  获取所选文件的直链地址
 // @match        https://www.guangyapan.com/*
 // @grant        GM.xmlHttpRequest
@@ -397,193 +397,380 @@
         return null;
     }
 
-    // ========== Aria2 发送功能 ==========
+    // ========== Aria2 多配置管理 ==========
 
     const ARIA2_STORAGE_KEY = 'gyp_aria2_config';
+    const MAX_ARIA2_CONFIGS = 5;
 
-    function getAria2Config() {
+    function generateId() {
+        return Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+    }
+
+    function getAria2Configs() {
         const saved = localStorage.getItem(ARIA2_STORAGE_KEY);
         if (saved) {
             try {
-                return JSON.parse(saved);
+                const data = JSON.parse(saved);
+                if (data.configs && Array.isArray(data.configs)) {
+                    return data;
+                }
+                // 旧格式兼容：转换为新格式
+                return {
+                    configs: [{
+                        id: generateId(),
+                        name: '默认',
+                        rpc: data.rpc || '',
+                        secret: data.secret || ''
+                    }],
+                    activeId: data.configs?.[0]?.id || null
+                };
             } catch (e) {
-                return { rpc: '', secret: '' };
+                return { configs: [], activeId: null };
             }
         }
-        return { rpc: '', secret: '' };
+        return { configs: [], activeId: null };
     }
 
-    const loadAria2Config = getAria2Config;
+    function getActiveAria2Config() {
+        const data = getAria2Configs();
+        if (!data.activeId || data.configs.length === 0) return null;
+        return data.configs.find(c => c.id === data.activeId) || null;
+    }
+
+    function saveAria2Configs(configs, activeId) {
+        localStorage.setItem(ARIA2_STORAGE_KEY, JSON.stringify({ configs, activeId }));
+        updateAria2ButtonState();
+    }
+
+    function setActiveAria2Config(id) {
+        const data = getAria2Configs();
+        if (data.configs.some(c => c.id === id)) {
+            data.activeId = id;
+            localStorage.setItem(ARIA2_STORAGE_KEY, JSON.stringify(data));
+            updateAria2ButtonState();
+        }
+    }
 
     function openAria2Modal() {
-        // 清理旧弹窗
         const existingModal = document.getElementById('gyp-aria2-modal-overlay');
         if (existingModal) existingModal.remove();
 
-        const config = loadAria2Config();
+        const data = getAria2Configs();
+        let configs = data.configs || [];
+        let activeId = data.activeId;
+        let editingId = null;
+        let showAddForm = false;
 
-        // 创建 Ant Design Modal，表单用 Shadow DOM 隔离 React 事件
         const modal = document.createElement('div');
         modal.id = 'gyp-aria2-modal-overlay';
         modal.style.cssText = 'position: fixed; inset: 0; z-index: 1000000;';
 
-        // 遮罩层
         const mask = document.createElement('div');
         mask.style.cssText = 'position: fixed; inset: 0; background: rgba(0,0,0,0.45);';
         mask.onclick = () => modal.remove();
         modal.appendChild(mask);
 
-        // 弹窗容器
         const wrap = document.createElement('div');
-        wrap.style.cssText = 'position: fixed; inset: 0; overflow: auto; outline: 0; display: flex; align-items: flex-start; justify-content: center; padding-top: 100px;';
+        wrap.style.cssText = 'position: fixed; inset: 0; overflow: auto; outline: 0; display: flex; align-items: flex-start; justify-content: center; padding-top: 80px;';
         modal.appendChild(wrap);
 
-        // Shadow DOM 宿主 - 隔离 React 事件
         const shadowHost = document.createElement('div');
         wrap.appendChild(shadowHost);
 
         const shadow = shadowHost.attachShadow({ mode: 'open' });
-        shadow.innerHTML = `
-            <style>
-                :host { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
-                .modal-box { width: 460px; background: #fff; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.2); overflow: hidden; }
-                .modal-header { padding: 20px 24px 16px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; display: flex; justify-content: space-between; align-items: center; }
-                .modal-title { font-size: 17px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
-                .modal-title svg { width: 22px; height: 22px; }
-                .modal-close { background: rgba(255,255,255,0.2); border: none; font-size: 20px; color: rgba(255,255,255,0.9); cursor: pointer; padding: 4px 10px; border-radius: 6px; line-height: 1; transition: all 0.2s; }
-                .modal-close:hover { background: rgba(255,255,255,0.3); color: #fff; }
-                .modal-body { padding: 24px; }
-                .form-group { margin-bottom: 20px; }
-                .form-group:last-child { margin-bottom: 0; }
-                .form-label { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; font-size: 14px; font-weight: 500; color: #333; }
-                .form-label svg { width: 16px; height: 16px; color: #667eea; }
-                .form-input { width: 100%; padding: 12px 14px; font-size: 14px; border: 2px solid #e8e8e8; border-radius: 8px; outline: none; box-sizing: border-box; color: #333; transition: all 0.25s; background: #fafbfc; }
-                .form-input:focus { border-color: #667eea; box-shadow: 0 0 0 3px rgba(102,126,234,0.15); background: #fff; }
-                .form-input::placeholder { color: #adb5bd; }
-                .form-input.secret-mask { font-family: monospace; letter-spacing: 2px; }
-                .form-hint { margin-top: 8px; font-size: 12px; color: #868e96; }
-                .modal-footer { padding: 16px 24px 20px; display: flex; justify-content: flex-end; gap: 12px; }
-                .btn { padding: 10px 22px; font-size: 14px; font-weight: 500; border-radius: 6px; cursor: pointer; border: none; transition: all 0.2s; }
-                .btn-cancel { background: #f1f3f5; color: #495057; }
-                .btn-cancel:hover { background: #e9ecef; color: #212529; }
-                .btn-save { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; box-shadow: 0 4px 12px rgba(102,126,234,0.35); }
-                .btn-save:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(102,126,234,0.4); }
-                .btn-save:active { transform: translateY(0); }
-                .aria2-icon { display: inline-block; width: 24px; height: 24px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 6px; position: relative; }
-                .aria2-icon::before { content: ''; position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); width: 0; height: 0; border-left: 10px solid #fff; border-top: 6px solid transparent; border-bottom: 6px solid transparent; }
-            </style>
-            <div class="modal-box">
-                <div class="modal-header">
-                    <div class="modal-title">
-                        <div class="aria2-icon"></div>
-                        Aria2 配置
-                    </div>
-                    <button class="modal-close" id="gyp-shadow-close">&times;</button>
-                </div>
-                <div class="modal-body">
-                    <div class="form-group">
-                        <label class="form-label">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
-                            RPC 地址
-                        </label>
-                        <input type="text" class="form-input" id="gyp-shadow-rpc" placeholder="http://localhost:6800/jsonrpc" value="${config.rpc || 'http://localhost:6800/jsonrpc'}">
-                        <div class="form-hint">Aria2 RPC 服务地址，通常为本地地址</div>
-                        <div class="form-hint" style="color: #b45309; display: flex; align-items: flex-start; gap: 8px; line-height: 1.6;">
-                            <span style="font-size: 28px; line-height: 1; flex-shrink: 0;">💡</span>
-                            <span>非 localhost/127.0.0.1 域名发送时会弹窗请求授权，建议选择"总是允许"，之后发送将直接通过，无需重复授权。</span>
+
+        const renderModal = () => {
+            const activeConfig = configs.find(c => c.id === activeId);
+            const editingConfig = editingId ? configs.find(c => c.id === editingId) : null;
+            const canAddMore = configs.length < MAX_ARIA2_CONFIGS;
+
+            const listHtml = configs.map(cfg => {
+                const isActive = cfg.id === activeId;
+                const isSelected = cfg.id === editingId;
+                const dotColor = isActive ? '#22c55e' : '#d1d5db';
+                return `
+                    <div class="config-item ${isSelected ? 'selected' : ''} ${isActive ? 'active' : ''}" data-id="${cfg.id}">
+                        <div class="config-item-left">
+                            <span class="config-dot" style="background: ${dotColor}; ${isActive ? 'box-shadow: 0 0 0 3px rgba(34,197,94,0.3);' : ''}"></span>
+                            <div class="config-info">
+                                <div class="config-name">${cfg.name || '未命名'}${isActive ? ' ✓' : ''}</div>
+                                <div class="config-rpc">${cfg.rpc || '未配置'}</div>
+                            </div>
+                        </div>
+                        <div class="config-actions">
+                            <button class="config-btn delete-btn" data-action="delete" data-id="${cfg.id}" title="删除">🗑️</button>
                         </div>
                     </div>
-                    <div class="form-group">
-                        <label class="form-label">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-                            密钥（可选）
-                        </label>
-                        <div style="position: relative;">
-                            <input type="text" class="form-input" id="gyp-shadow-secret" placeholder="留空则无密钥" value="">
-                            <input type="hidden" id="gyp-shadow-secret-real" value="${config.secret || ''}">
+                `;
+            }).join('');
+
+            shadow.innerHTML = `
+                <style>
+                    :host { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+                    .modal-box { width: 680px; background: #fff; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.2); overflow: hidden; }
+                    .modal-header { padding: 16px 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; display: flex; justify-content: space-between; align-items: center; }
+                    .modal-title { font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+                    .aria2-icon { display: inline-block; width: 22px; height: 22px; background: rgba(255,255,255,0.2); border-radius: 5px; position: relative; }
+                    .aria2-icon::before { content: ''; position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); width: 0; height: 0; border-left: 9px solid #fff; border-top: 5px solid transparent; border-bottom: 5px solid transparent; }
+                    .modal-close { background: rgba(255,255,255,0.2); border: none; font-size: 18px; color: rgba(255,255,255,0.9); cursor: pointer; padding: 4px 8px; border-radius: 5px; line-height: 1; }
+                    .modal-close:hover { background: rgba(255,255,255,0.3); color: #fff; }
+                    .modal-body { display: flex; min-height: 320px; }
+                    .modal-left { width: 200px; border-right: 1px solid #e8e8e8; padding: 16px; display: flex; flex-direction: column; }
+                    .modal-right { flex: 1; padding: 16px 20px; display: flex; flex-direction: column; }
+                    .modal-left-title { font-size: 13px; font-weight: 600; color: #868e96; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+                    .config-list { border: 2px solid #f1f3f4; border-radius: 8px; flex: 1; overflow-y: auto; }
+                    .config-item { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid #f1f3f4; transition: background 0.15s; cursor: pointer; }
+                    .config-item:last-child { border-bottom: none; }
+                    .config-item:hover { background: #f8f9fa; }
+                    .config-item.active { background: #f0fdf4; }
+                    .config-item.selected { background: #e8f4ff; border-left: 3px solid #667eea; }
+                    .config-item-left { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
+                    .config-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; transition: all 0.2s; }
+                    .config-info { min-width: 0; }
+                    .config-name { font-size: 13px; font-weight: 500; color: #333; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+                    .config-rpc { font-size: 11px; color: #868e96; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+                    .config-actions { display: flex; gap: 2px; flex-shrink: 0; }
+                    .config-btn { background: none; border: none; font-size: 12px; cursor: pointer; padding: 3px 5px; border-radius: 3px; opacity: 0.5; transition: all 0.15s; }
+                    .config-btn:hover { opacity: 1; background: #e9ecef; }
+                    .add-section { margin-top: 12px; }
+                    .add-btn { width: 100%; padding: 8px; background: #f8f9fa; border: 2px dashed #d1d5db; border-radius: 6px; font-size: 12px; color: #667eea; cursor: pointer; transition: all 0.2s; font-weight: 500; }
+                    .add-btn:hover { border-color: #667eea; background: #f0f4ff; }
+                    .add-btn:disabled { opacity: 0.5; cursor: not-allowed; color: #868e96; }
+                    .config-btn { background: none; border: none; font-size: 12px; cursor: pointer; padding: 4px 6px; border-radius: 4px; opacity: 0.6; transition: all 0.15s; }
+                    .config-btn:hover { opacity: 1; background: #e9ecef; }
+                    .form-title { font-size: 15px; font-weight: 600; color: #333; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+                    .form-title-icon { width: 24px; height: 24px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 6px; display: flex; align-items: center; justify-content: center; }
+                    .form-title-icon::before { content: ''; width: 0; height: 0; border-left: 8px solid #fff; border-top: 4px solid transparent; border-bottom: 4px solid transparent; }
+                    .form-group { margin-bottom: 14px; }
+                    .form-label { display: block; font-size: 13px; font-weight: 500; color: #495057; margin-bottom: 6px; }
+                    .form-input { width: 100%; padding: 10px 12px; font-size: 13px; border: 2px solid #e8e8e8; border-radius: 6px; outline: none; box-sizing: border-box; color: #333; transition: all 0.25s; background: #fafbfc; }
+                    .form-input:focus { border-color: #667eea; box-shadow: 0 0 0 3px rgba(102,126,234,0.15); background: #fff; }
+                    .secret-input { font-family: monospace; letter-spacing: 2px; }
+                    .form-hint { margin-top: 4px; font-size: 11px; color: #868e96; }
+                    .form-actions { display: flex; gap: 10px; margin-top: 20px; }
+                    .btn { padding: 10px 20px; font-size: 13px; font-weight: 500; border-radius: 6px; cursor: pointer; border: none; transition: all 0.2s; }
+                    .btn-cancel { background: #e9ecef; color: #495057; }
+                    .btn-cancel:hover { background: #dee2e6; }
+                    .btn-save { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; box-shadow: 0 4px 12px rgba(102,126,234,0.35); }
+                    .btn-save:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(102,126,234,0.4); }
+                    .empty-state { text-align: center; color: #868e96; padding: 40px 20px; }
+                    .empty-state-icon { font-size: 48px; margin-bottom: 12px; opacity: 0.5; }
+                </style>
+                <div class="modal-box">
+                    <div class="modal-header">
+                        <div class="modal-title">
+                            <div class="aria2-icon"></div>
+                            Aria2 配置
                         </div>
-                        <div class="form-hint">RPC 连接的密钥，无密码时留空</div>
+                        <button class="modal-close" id="gyp-shadow-close">&times;</button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="modal-left">
+                            <div class="modal-left-title">配置列表</div>
+                            ${configs.length > 0 ? `<div class="config-list">${listHtml}</div>` : ''}
+                            <div class="add-section">
+                                <button class="add-btn" id="gyp-add-btn" ${!canAddMore ? 'disabled' : ''}>
+                                    ${canAddMore ? '+ 添加配置' : `已达上限（${MAX_ARIA2_CONFIGS}套）`}
+                                </button>
+                            </div>
+                        </div>
+                        <div class="modal-right">
+                            ${showAddForm || editingConfig ? `
+                                <div class="form-title">
+                                    <div class="form-title-icon"></div>
+                                    ${editingConfig ? '编辑配置' : '添加配置'}
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">名称</label>
+                                    <input type="text" class="form-input" id="gyp-form-name" placeholder="如：本地 / NAS / VPS" value="${editingConfig?.name || ''}">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">RPC 地址 <span style="font-weight: normal; color: #868e96; font-size: 12px;">（示例：http://localhost:6800/jsonrpc）</span></label>
+                                    <input type="text" class="form-input" id="gyp-form-rpc" placeholder="http://localhost:6800/jsonrpc" value="${editingConfig?.rpc || ''}">
+                                    <div class="form-hint" style="color: #b45309; display: flex; align-items: flex-start; gap: 8px; line-height: 1.6;">
+                                        <span style="font-size: 28px; line-height: 1; flex-shrink: 0;">💡</span>
+                                        <span>非 localhost/127.0.0.1 域名发送时会弹窗请求授权，建议选择"总是允许"，之后发送将直接通过，无需重复授权。</span>
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">密钥（可选）</label>
+                                    <div style="position: relative;">
+                                        <input type="text" class="form-input secret-input" id="gyp-form-secret" placeholder="留空则无密钥" value="">
+                                        <input type="hidden" id="gyp-form-secret-real" value="${editingConfig?.secret || ''}">
+                                    </div>
+                                    ${editingConfig?.secret ? '<div class="form-hint">已有密钥，如需修改请输入新值</div>' : ''}
+                                </div>
+                                <div class="form-actions">
+                                    ${editingConfig ? `<button class="btn" id="gyp-form-default" style="background: #22c55e; color: #fff; margin-right: auto;">${editingId === activeId ? '✓ 当前默认' : '设为默认'}</button>` : ''}
+                                    <button class="btn btn-cancel" id="gyp-form-cancel">取消</button>
+                                    <button class="btn btn-save" id="gyp-form-save">${editingConfig ? '保存' : '添加'}</button>
+                                </div>
+                            ` : `
+                                <div class="empty-state">
+                                    <div class="empty-state-icon">⚙</div>
+                                    <div>选择一个配置编辑</div>
+                                    <div style="font-size: 12px; margin-top: 4px;">或点击左侧"添加配置"新建</div>
+                                </div>
+                            `}
+                        </div>
+                    </div>
+                    <div style="padding: 12px 20px; background: #f8f9fa; border-top: 1px solid #e8e8e8; display: flex; justify-content: space-between; align-items: center;">
+                        <div style="font-size: 12px; color: #868e96;">当前使用：${activeConfig?.name || '未选择'}</div>
+                        <button class="btn" style="background: #495057; color: #fff; padding: 8px 16px;" id="gyp-shadow-close-btn">关闭</button>
                     </div>
                 </div>
-                <div class="modal-footer">
-                    <button class="btn btn-cancel" id="gyp-shadow-cancel">取消</button>
-                    <button class="btn btn-save" id="gyp-shadow-save">保存配置</button>
-                </div>
-            </div>
-        `;
+            `;
 
-        // Shadow DOM 事件 - 原生事件，不受 React 影响
-        shadow.getElementById('gyp-shadow-close').onclick = () => modal.remove();
-        shadow.getElementById('gyp-shadow-cancel').onclick = () => modal.remove();
+            // 绑定事件
+            shadow.getElementById('gyp-shadow-close').onclick = () => modal.remove();
+            shadow.getElementById('gyp-shadow-close-btn').onclick = () => modal.remove();
 
-        // 密钥显示/隐藏处理
-        const secretInput = shadow.getElementById('gyp-shadow-secret');
-        const secretReal = shadow.getElementById('gyp-shadow-secret-real');
-        const realValue = secretReal.value;
-        if (realValue) {
-            secretInput.value = '•'.repeat(realValue.length);
-            secretInput.classList.add('secret-mask');
-        }
-        secretInput.addEventListener('input', () => {
-            const val = secretInput.value;
-            // 如果输入的是圆点，说明用户在修改被隐藏的密码
-            if (val.includes('•')) {
-                // 清空，用 real 恢复显示
-                const stored = secretReal.value;
-                if (stored) {
-                    secretInput.value = '•'.repeat(stored.length);
-                    // 把光标移到末尾
-                    setTimeout(() => {
-                        secretInput.setSelectionRange(stored.length, stored.length);
-                    }, 0);
-                }
-            } else {
-                // 用户输入了明文
-                secretReal.value = val;
-                secretInput.classList.add('secret-mask');
-            }
-        });
-        secretInput.addEventListener('focus', () => {
-            // 聚焦时显示真实值（临时）
-            const stored = secretReal.value;
-            if (stored) {
-                secretInput.value = stored;
-                secretInput.classList.remove('secret-mask');
-                setTimeout(() => {
-                    secretInput.setSelectionRange(stored.length, stored.length);
-                }, 0);
-            }
-        });
-        secretInput.addEventListener('blur', () => {
-            // 失去焦点时重新隐藏
-            const stored = secretReal.value;
-            if (stored) {
-                secretInput.value = '•'.repeat(stored.length);
-                secretInput.classList.add('secret-mask');
-            }
-        });
+            if (showAddForm || editingConfig) {
+                shadow.getElementById('gyp-form-cancel').onclick = () => {
+                    showAddForm = false;
+                    editingId = null;
+                    renderModal();
+                    bindSecretEvents();
+                };
+                shadow.getElementById('gyp-form-save').onclick = () => {
+                    const name = shadow.getElementById('gyp-form-name').value.trim();
+                    const rpc = shadow.getElementById('gyp-form-rpc').value.trim();
+                    const secret = shadow.getElementById('gyp-form-secret-real').value;
 
-        shadow.getElementById('gyp-shadow-save').onclick = () => {
-            const rpc = shadow.getElementById('gyp-shadow-rpc').value.trim();
-            const secret = secretReal.value;
-            if (!rpc) {
-                alert('请输入 RPC 地址');
-                return;
+                    if (!rpc) {
+                        alert('请输入 RPC 地址');
+                        return;
+                    }
+
+                    if (editingConfig) {
+                        configs = configs.map(c => c.id === editingId ? { ...c, name, rpc, secret: secret || c.secret } : c);
+                    } else {
+                        const newConfig = { id: generateId(), name, rpc, secret };
+                        configs.push(newConfig);
+                        if (!activeId) activeId = newConfig.id;
+                    }
+
+                    saveAria2Configs(configs, activeId);
+                    showAddForm = false;
+                    editingId = null;
+                    showToast(editingConfig ? '配置已更新' : '配置已添加');
+                    renderModal();
+                    bindSecretEvents();
+                };
             }
-            localStorage.setItem('gyp_aria2_config', JSON.stringify({ rpc, secret }));
-            showToast('配置已保存');
-            updateAria2ButtonState();
-            modal.remove();
+
+            if (canAddMore) {
+                shadow.getElementById('gyp-add-btn').onclick = () => {
+                    showAddForm = true;
+                    editingId = null;
+                    renderModal();
+                    bindSecretEvents();
+                    setTimeout(() => shadow.getElementById('gyp-form-name')?.focus(), 50);
+                };
+            }
+
+            // 设为默认按钮
+            const defaultBtn = shadow.getElementById('gyp-form-default');
+            if (defaultBtn) {
+                defaultBtn.onclick = () => {
+                    if (editingId) {
+                        activeId = editingId;
+                        saveAria2Configs(configs, activeId);
+                        showToast('已设为默认');
+                        renderModal();
+                        bindSecretEvents();
+                    }
+                };
+            }
         };
 
-        // 聚焦
-        setTimeout(() => shadow.getElementById('gyp-shadow-rpc').focus(), 100);
+        // 使用 shadow 内部事件委托
+        const handleShadowEvent = (e) => {
+            const target = e.target;
+            const configItem = target.closest('.config-item');
+            const actionBtn = target.closest('[data-action]');
 
+            // 点击删除按钮
+            if (actionBtn?.dataset.action === 'delete') {
+                const id = actionBtn.dataset.id;
+                const config = configs.find(c => c.id === id);
+                if (!config) return;
+
+                if (configs.length === 1) {
+                    alert('至少需要保留一个配置');
+                    return;
+                }
+
+                if (!confirm(`确定删除配置"${config.name || config.rpc}"？`)) return;
+
+                configs = configs.filter(c => c.id !== id);
+                if (activeId === id) {
+                    activeId = configs[0]?.id || null;
+                }
+                editingId = null;
+                saveAria2Configs(configs, activeId);
+                showToast('配置已删除');
+                renderModal();
+                bindSecretEvents();
+                return;
+            }
+
+            // 点击列表项选中并进入编辑
+            if (configItem && !actionBtn) {
+                const id = configItem.dataset.id;
+                if (id) {
+                    editingId = id;
+                    showAddForm = false;
+                    renderModal();
+                    bindSecretEvents();
+                    setTimeout(() => shadow.getElementById('gyp-form-name')?.focus(), 50);
+                }
+            }
+        };
+
+        shadow.addEventListener('click', handleShadowEvent);
+
+        // 密钥输入框事件（每次渲染后绑定）
+        const bindSecretEvents = () => {
+            const secretInput = shadow.getElementById('gyp-form-secret');
+            const secretReal = shadow.getElementById('gyp-form-secret-real');
+            if (!secretInput || !secretReal) return;
+
+            // 初始化：已有密钥显示圆点
+            if (secretReal.value) {
+                secretInput.value = '•'.repeat(secretReal.value.length);
+                secretInput.classList.add('secret-input');
+            }
+
+            // 输入时：保存真实值到隐藏字段
+            secretInput.oninput = function() {
+                secretReal.value = this.value;
+            };
+
+            // 聚焦时：显示真实值
+            secretInput.onfocus = function() {
+                if (secretReal.value) {
+                    this.value = secretReal.value;
+                    this.classList.remove('secret-input');
+                }
+            };
+
+            // 失焦时：显示圆点
+            secretInput.onblur = function() {
+                if (secretReal.value) {
+                    this.value = '•'.repeat(secretReal.value.length);
+                    this.classList.add('secret-input');
+                }
+            };
+        };
+
+        renderModal();
+        bindSecretEvents();
         document.body.appendChild(modal);
     }
 
     function updateAria2ButtonState() {
-        // 更新配置按钮状态
+        // 按钮保持原有样式，无需额外更新
     }
 
     function getFileNameFromUrl(url) {
@@ -636,9 +823,10 @@
     }
 
     async function aria2SendLinks(links) {
-        const config = getAria2Config();
-        if (!config.rpc) {
-            showToast('请先配置 RPC 地址', 2000, 'warning');
+        const config = getActiveAria2Config();
+        if (!config || !config.rpc) {
+            showToast('请先配置 Aria2', 2000, 'warning');
+            openAria2Modal();
             return { success: 0, failed: 0, errors: [] };
         }
 
@@ -867,14 +1055,15 @@
     }
 
     async function sendToAria2Selected() {
-        const config = getAria2Config();
-        if (!config.rpc) {
-            showToast('请先配置 RPC 地址', 2000, 'warning');
-            return;
-        }
         const links = getSelectedLinks();
         if (links.length === 0) {
             showToast('请先选择要发送的链接', 2000, 'warning');
+            return;
+        }
+        const config = getActiveAria2Config();
+        if (!config || !config.rpc) {
+            showToast('请先配置 Aria2', 2500, 'warning');
+            openAria2Modal();
             return;
         }
         const totalSize = links.reduce((sum, link) => sum + (link.size || 0), 0);
@@ -882,9 +1071,9 @@
             showToast('正在发送到 Aria2...', 3000);
             const result = await aria2SendLinks(links);
             hideToast();
-            if (result.failed === 0) {
+            if (result && result.success > 0) {
                 showAria2SuccessAlert(result.success);
-            } else {
+            } else if (result && result.failed > 0) {
                 showToast('发送完成：成功 ' + result.success + ' 个，失败 ' + result.failed + ' 个', 3000, 'warning');
                 if (result.errors.length > 0) {
                     showAria2ErrorAlert(result.errors);
@@ -894,14 +1083,15 @@
     }
 
     async function sendToAria2All() {
-        const config = getAria2Config();
-        if (!config.rpc) {
-            showToast('请先配置 RPC 地址', 2000, 'warning');
-            return;
-        }
         const links = getAllLinks();
         if (links.length === 0) {
             showToast('没有可发送的链接', 2000, 'warning');
+            return;
+        }
+        const config = getActiveAria2Config();
+        if (!config || !config.rpc) {
+            showToast('请先配置 Aria2', 2500, 'warning');
+            openAria2Modal();
             return;
         }
         const totalSize = links.reduce((sum, link) => sum + (link.size || 0), 0);
@@ -909,9 +1099,9 @@
             showToast('正在发送到 Aria2...', 3000);
             const result = await aria2SendLinks(links);
             hideToast();
-            if (result.failed === 0) {
+            if (result && result.success > 0) {
                 showAria2SuccessAlert(result.success);
-            } else {
+            } else if (result && result.failed > 0) {
                 showToast('发送完成：成功 ' + result.success + ' 个，失败 ' + result.failed + ' 个', 3000, 'warning');
                 if (result.errors.length > 0) {
                     showAria2ErrorAlert(result.errors);
@@ -929,7 +1119,12 @@
             '<div class="gyp-modal-header">' +
             '<span class="gyp-modal-title">获取直链</span>' +
             '<div class="gyp-modal-header-actions">' +
-            '<button class="gyp-settings-btn" id="gyp-aria2-config" title="Aria2 配置">⚙ Aria2</button>' +
+            '<button class="gyp-aria2-btn" id="gyp-aria2-btn" title="Aria2 配置">' +
+            '<span class="gyp-aria2-btn-icon">⚙</span>' +
+            '<span class="gyp-aria2-btn-text">Aria2</span>' +
+            '<svg class="gyp-aria2-btn-arrow gyp-hidden" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>' +
+            '</button>' +
+            '<div class="gyp-aria2-dropdown" id="gyp-aria2-dropdown"></div>' +
             '<button class="gyp-modal-close" id="gyp-modal-close">&times;</button>' +
             '</div>' +
             '</div>' +
@@ -984,8 +1179,75 @@
         modal.querySelector('#gyp-copy-selected-name').onclick = copySelectedNames;
         modal.querySelector('#gyp-deselect-selected').onclick = deselectAll;
 
-        // Aria2 事件处理
-        modal.querySelector('#gyp-aria2-config').onclick = openAria2Modal;
+        // Aria2 下拉菜单
+        const aria2Btn = modal.querySelector('#gyp-aria2-btn');
+        const arrowEl = aria2Btn?.querySelector('.gyp-aria2-btn-arrow');
+        const dropdown = modal.querySelector('#gyp-aria2-dropdown');
+
+        const updateAria2Dropdown = () => {
+            const configs = getAria2Configs();
+
+            if (configs.configs.length <= 1) {
+                arrowEl?.classList.add('gyp-hidden');
+                dropdown.classList.remove('open');
+                aria2Btn?.classList.remove('open');
+                return;
+            }
+
+            const activeId = getActiveAria2Config()?.id;
+            arrowEl?.classList.remove('gyp-hidden');
+
+            dropdown.innerHTML = configs.configs.map(cfg => {
+                const isActive = cfg.id === activeId;
+                return `<div class="gyp-dropdown-item ${isActive ? 'active' : ''}" data-id="${cfg.id}">
+                    <span class="check">${isActive ? '✓' : ''}</span>
+                    <span>${cfg.name || cfg.rpc}</span>
+                </div>`;
+            }).join('') + '<div class="gyp-dropdown-divider"></div>' +
+            '<div class="gyp-dropdown-item" id="gyp-dropdown-manage">⚙ 管理配置</div>';
+
+            dropdown.querySelectorAll('.gyp-dropdown-item[data-id]').forEach(item => {
+                item.onclick = () => {
+                    setActiveAria2Config(item.dataset.id);
+                    dropdown.classList.remove('open');
+                    aria2Btn?.classList.remove('open');
+                    arrowEl?.classList.remove('open');
+                };
+            });
+
+            const manageItem = dropdown.querySelector('#gyp-dropdown-manage');
+            if (manageItem) {
+                manageItem.onclick = () => {
+                    dropdown.classList.remove('open');
+                    aria2Btn?.classList.remove('open');
+                    arrowEl?.classList.remove('open');
+                    openAria2Modal();
+                };
+            }
+        };
+
+        aria2Btn.onclick = (e) => {
+            const configs = getAria2Configs();
+            if (configs.configs.length <= 1) {
+                openAria2Modal();
+                return;
+            }
+            e.stopPropagation();
+            dropdown.classList.toggle('open');
+            aria2Btn.classList.toggle('open');
+            arrowEl?.classList.toggle('open');
+            updateAria2Dropdown();
+        };
+
+        document.addEventListener('click', (e) => {
+            if (!aria2Btn.contains(e.target) && !dropdown.contains(e.target)) {
+                dropdown.classList.remove('open');
+                aria2Btn?.classList.remove('open');
+                arrowEl?.classList.remove('open');
+            }
+        });
+
+        updateAria2Dropdown();
         modal.querySelector('#gyp-aria2-send-selected').onclick = sendToAria2Selected;
         modal.querySelector('#gyp-aria2-send-all').onclick = sendToAria2All;
 
@@ -1114,11 +1376,19 @@
             clearTimeout(toast._timeoutId);
             toast._timeoutId = null;
         }
+        if (toast._hideTimerId) {
+            clearTimeout(toast._hideTimerId);
+            toast._hideTimerId = null;
+        }
         toast.querySelector('.gyp-toast-msg').textContent = message;
         toast.className = 'gyp-toast gyp-toast-show gyp-toast-' + type;
         toast._timeoutId = setTimeout(function() {
-            toast.className = 'gyp-toast';
+            toast.className = 'gyp-toast gyp-toast-' + type;
             toast._timeoutId = null;
+            toast._hideTimerId = setTimeout(function() {
+                toast.className = 'gyp-toast';
+                toast._hideTimerId = null;
+            }, 300);
         }, duration);
     }
 
@@ -1128,6 +1398,10 @@
             if (toast._timeoutId) {
                 clearTimeout(toast._timeoutId);
                 toast._timeoutId = null;
+            }
+            if (toast._hideTimerId) {
+                clearTimeout(toast._hideTimerId);
+                toast._hideTimerId = null;
             }
             toast.className = 'gyp-toast';
         }
@@ -1342,7 +1616,6 @@
                 }
                 if (attempt < MAX_RETRIES - 1) {
                     const delay = RETRY_BASE_DELAY * Math.pow(2, attempt);
-                    console.log(`GYP: Retry ${attempt + 1}/${MAX_RETRIES} after ${delay}ms:`, err.message);
                     await sleep(delay);
                 }
             }
@@ -1538,9 +1811,7 @@
         removeButton();
 
         const uploadBtn = findUploadButton();
-        if (!uploadBtn) {
-            return;
-        }
+        if (!uploadBtn) return;
 
         const btnContainer = uploadBtn.parentNode;
         if (!btnContainer) return;
@@ -1559,6 +1830,8 @@
         btn.style.textShadow = '0 1px 2px rgba(0,0,0,0.2)';
         btn.style.transition = 'all 0.3s ease';
         btn.style.cursor = 'pointer';
+        btn.style.display = 'inline-block';
+        btn.style.visibility = 'visible';
         btn.onclick = startFetch;
 
         btnContainer.insertBefore(btn, uploadBtn.nextSibling);
@@ -1574,9 +1847,22 @@
             '.gyp-modal-v2 { background: #fff; border-radius: 8px; width: 900px !important; min-width: 900px !important; max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 4px 24px rgba(0, 0, 0, 0.2); overflow: hidden; user-select: text; -webkit-user-select: text; flex-shrink: 0; }',
             '.gyp-modal-header { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid #e8e8e8; flex-shrink: 0; }',
             '.gyp-modal-title { font-size: 16px; font-weight: 500; color: #333; }',
-            '.gyp-modal-header-actions { display: flex; align-items: center; gap: 8px; }',
-            '.gyp-settings-btn { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; color: #fff; padding: 6px 14px; transition: all 0.3s ease; box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3); }',
-            '.gyp-settings-btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4); }',
+            '.gyp-modal-header-actions { display: flex; align-items: center; gap: 8px; position: relative; }',
+            '.gyp-aria2-btn { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; color: #fff; padding: 6px 10px; transition: all 0.2s; box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3); display: flex; align-items: center; gap: 6px; position: relative; }',
+            '.gyp-aria2-btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4); }',
+            '.gyp-aria2-btn.open { border-radius: 6px 6px 0 0; }',
+            '.gyp-aria2-btn-icon { font-size: 14px; }',
+            '.gyp-aria2-btn-text { }',
+            '.gyp-aria2-btn-arrow { transition: transform 0.2s; }',
+            '.gyp-aria2-btn-arrow.open { transform: rotate(180deg); }',
+            '.gyp-aria2-dropdown { display: none; position: absolute; top: 100%; right: 0; margin-top: 0; background: #fff; border-radius: 0 0 8px 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.2); min-width: 160px; z-index: 1001; overflow: hidden; }',
+            '.gyp-aria2-dropdown.open { display: block; }',
+            '.gyp-dropdown-item { padding: 10px 14px; font-size: 13px; color: #333; cursor: pointer; transition: background 0.15s; display: flex; align-items: center; gap: 8px; }',
+            '.gyp-dropdown-item:hover { background: #f0f4ff; }',
+            '.gyp-dropdown-item.active { background: #e8ecff; color: #667eea; font-weight: 500; }',
+            '.gyp-dropdown-item .check { width: 16px; height: 16px; border: 2px solid #d1d5db; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; color: #fff; }',
+            '.gyp-dropdown-item.active .check { background: #667eea; border-color: #667eea; }',
+            '.gyp-dropdown-divider { height: 1px; background: #e8e8e8; margin: 4px 0; }',
             '.gyp-modal-close { background: none; border: none; font-size: 24px; cursor: pointer; color: #999; padding: 0; line-height: 1; }',
             '.gyp-modal-close:hover { color: #666; }',
             '.gyp-modal-body { padding: 20px; flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }',
@@ -1639,7 +1925,7 @@
             '.gyp-btn-danger:hover { background: #ff7875; border-color: #ff7875; color: #fff; }',
             '.gyp-btn-sm { padding: 4px 10px; font-size: 12px; cursor: pointer; }',
             '.gyp-script-btn:hover { background: linear-gradient(135deg, #5a67d8 0%, #6b46c1 50%, #e879f9 100%) !important; box-shadow: 0 6px 20px rgba(102, 126, 234, 0.5), inset 0 1px 0 rgba(255,255,255,0.3) !important; transform: translateY(-1px); }',
-            '.gyp-toast { position: fixed; top: 80px; left: 50%; transform: translateX(-50%); z-index: 1000000; background: rgba(0, 0, 0, 0.75); color: #fff; padding: 12px 24px; border-radius: 6px; font-size: 14px; opacity: 0; transition: opacity 0.3s ease; pointer-events: none; }',
+            '.gyp-toast { position: fixed; top: 80px; left: 50%; transform: translateX(-50%); z-index: 2000000; background: rgba(0, 0, 0, 0.75); color: #fff; padding: 12px 24px; border-radius: 6px; font-size: 14px; opacity: 0; transition: opacity 0.3s ease; pointer-events: none; }',
             '.gyp-toast.gyp-toast-show { opacity: 1; }',
             '.gyp-toast.gyp-toast-warning { background: rgba(250, 173, 20, 0.95); }',
             '.gyp-toast.gyp-toast-error { background: rgba(255, 77, 79, 0.95); }',
@@ -1670,8 +1956,12 @@
     }
 
     function tryInit() {
-        addStyles();
-        addButton();
+        try {
+            addStyles();
+            addButton();
+        } catch (e) {
+            console.error('GYP init error:', e);
+        }
     }
 
     function init() {
